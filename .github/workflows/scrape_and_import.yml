@@ -1,0 +1,114 @@
+name: Scrape & Import (hourly)
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # every hour
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # --- Chrome + chromedriver for Selenium/Splinter ---
+      - name: Install Chrome & chromedriver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb unzip curl jq mysql-client
+          wget -q "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get -f install -y
+          CHROME_MAJOR=$(google-chrome --version | sed -E 's/.* ([0-9]+)\..*/\1/')
+          DRIVER_TAG=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}")
+          curl -sSL -o /tmp/chromedriver.zip \
+            "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_TAG}/linux64/chromedriver-linux64.zip"
+          unzip -o /tmp/chromedriver.zip -d /tmp
+          sudo mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
+          sudo chmod +x /usr/local/bin/chromedriver
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install splinter selenium
+          fi
+
+      # --- SSH tunnel to Hostinger -> forwards MySQL to local port 3307 ---
+      - name: Start SSH tunnel to Hostinger (MySQL)
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          SSH_KEY:  ${{ secrets.HOSTINGER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf "Host *\n  ServerAliveInterval 30\n  ServerAliveCountMax 3\n  StrictHostKeyChecking no\n" > ~/.ssh/config
+          # If your MySQL is local on the server use 127.0.0.1:3306 target (default on Hostinger):
+          ssh -f -N -L 3307:127.0.0.1:3306 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST"
+          sleep 1
+          ss -lnt | grep 3307
+
+      # --- Run your scraper (works even if the script uses non-headless Chrome) ---
+      - name: Run scraper
+        env:
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3307
+          DB_DATABASE: ${{ secrets.DB_DATABASE }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          KRW_EUR:     ${{ secrets.KRW_EUR }}
+          CSV_DIR:     ${{ secrets.CSV_DIR }}
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1920x1080x24 &  # allows non-headless Chrome
+          # your script writes scripts/cars.csv
+          python scripts/encar_scraper.py
+
+      # --- Import CSV into MySQL with upsert (avoid duplicate errors) ---
+      - name: Import CSV into MySQL (UPSERT)
+        env:
+          DB_DATABASE: ${{ secrets.DB_DATABASE }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          CSV="scripts/cars.csv"
+          test -f "$CSV" || { echo "CSV not found: $CSV"; exit 1; }
+
+          # Enable LOCAL INFILE
+          mysql -h 127.0.0.1 -P 3307 -u "$DB_USERNAME" -p"$DB_PASSWORD" -e "SET SESSION local_infile=1;"
+
+          # Adjust table/columns to match your schema exactly:
+          mysql --local-infile=1 -h 127.0.0.1 -P 3307 -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" -e "
+            LOAD DATA LOCAL INFILE '$CSV'
+            INTO TABLE vehicles
+            FIELDS TERMINATED BY ',' ENCLOSED BY '\"'
+            LINES TERMINATED BY '\n'
+            IGNORE 1 LINES
+            (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url)
+            SET updated_at = NOW()
+            ON DUPLICATE KEY UPDATE
+              cmimi_eur=VALUES(cmimi_eur),
+              kilometrazhi_km=VALUES(kilometrazhi_km),
+              karburanti=VALUES(karburanti),
+              ngjyra=VALUES(ngjyra),
+              transmisioni=VALUES(transmisioni),
+              uleset=VALUES(uleset),
+              engine_cc=VALUES(engine_cc),
+              images=VALUES(images),
+              opsionet=VALUES(opsionet),
+              raporti_url=VALUES(raporti_url),
+              updated_at=NOW();
+          "
