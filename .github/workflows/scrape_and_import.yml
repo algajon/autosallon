@@ -74,7 +74,7 @@ jobs:
           export DISPLAY=:99
           Xvfb :99 -screen 0 1920x1080x24 &  # allows non-headless Chrome
           # your script writes scripts/cars.csv
-          python scripts/encar_scraper.py
+          python scripts/github.py
 
       # --- Import CSV into MySQL with upsert (avoid duplicate errors) ---
       - name: Import CSV into MySQL (UPSERT)
