@@ -3,7 +3,10 @@ name: Scrape & Import (Hostinger via SSH tunnel)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"   # run hourly at :17
+    - cron: "17 * * * *" # run hourly at :17
+
+permissions:
+  contents: read
 
 concurrency:
   group: scrape-import
@@ -15,11 +18,12 @@ jobs:
     timeout-minutes: 45
 
     env:
-      # Local tunnel endpoint the runner will use
+      # Local endpoint for the SSH tunnel (runner side)
       DB_HOST: 127.0.0.1
       DB_PORT: 3307
+
       # Where your scraper writes the CSV
-      CSV_DIR: ${{ secrets.CSV_DIR != '' && secrets.CSV_DIR || 'scripts' }}
+      CSV_DIR: ${{ secrets.CSV_DIR || 'scripts' }}
       CSV_NAME: cars.csv
 
     steps:
@@ -36,24 +40,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mysql-client openssh-client
 
-      # --- SSH key-only auth (no password) ---
-      - name: Start SSH tunnel to Hostinger (MySQL)
-        id: tunnel
+      # --- SSH key-only auth (no password fallback) ---
+      - name: Prepare SSH key (key-only; no password)
+        id: prep-ssh
         env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
           SSH_KEY:  ${{ secrets.HOSTINGER_SSH_KEY }}
         run: |
           set -euo pipefail
-
-          # Write private key and harden perms
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-          # Strictly prefer key auth; never fall back to password
-          cat > ~/.ssh/config <<CFG
+          # Fail early if key is invalid or passphrase-protected
+          if ! ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null 2>&1; then
+            echo "The private key in HOSTINGER_SSH_KEY appears invalid or passphrase-protected."
+            exit 1
+          fi
+
+          # SSH client defaults (force key-only)
+          cat > ~/.ssh/config <<'CFG'
           Host *
             ServerAliveInterval 30
             ServerAliveCountMax 3
@@ -63,13 +68,31 @@ jobs:
             StrictHostKeyChecking no
           CFG
 
-          # If your MySQL is local on the server use 127.0.0.1:3306 (default on Hostinger)
-          ssh -f -N \
-            -L ${DB_PORT}:127.0.0.1:3306 \
-            -p "${SSH_PORT}" \
-            "${SSH_USER}@${SSH_HOST}"
+      - name: Try SSH auth once (verbose)
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+        run: |
+          set -e
+          ssh -vvv -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
+              -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'Auth OK'; exit"
 
-          # Wait for the local tunnel to be ready
+      - name: Start SSH tunnel to Hostinger (MySQL)
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          DB_PORT:  ${{ env.DB_PORT }}
+        run: |
+          set -euo pipefail
+          ssh -f -N \
+            -o ExitOnForwardFailure=yes \
+            -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
+            -L ${DB_PORT}:127.0.0.1:3306 \
+            -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
+
+          # Wait for tunnel
           for i in {1..20}; do
             if ss -lnt | grep -q ":${DB_PORT}"; then
               echo "Tunnel up on port ${DB_PORT}"
@@ -81,11 +104,9 @@ jobs:
           exit 1
 
       # --- Run your scraper (writes CSV to $CSV_DIR/$CSV_NAME) ---
-      # Adjust installs/command to your repo layout
       - name: Install Python requirements
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # If your scraper needs extra libs, install them here as well.
 
       - name: Run scraper
         env:
@@ -93,14 +114,13 @@ jobs:
         run: |
           set -e
           mkdir -p "$CSV_DIR"
-          # === Replace this line with your actual scraper entrypoint ===
-          # Example:
+          # === replace with your real entrypoint if different ===
           python scripts/encar_scraper.py
-          # ============================================================
-          test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found" >&2; exit 1)
+          # ======================================================
+          test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
+          ls -lh "${CSV_DIR}/${CSV_NAME}"
 
       # --- Import CSV into MySQL over the tunnel ---
-      # This uses a staging table + upsert. Adjust table/columns to your schema.
       - name: Import CSV into MySQL (UPSERT)
         env:
           DB_NAME: ${{ secrets.DB_DATABASE }}
@@ -108,15 +128,17 @@ jobs:
           DB_PASS: ${{ secrets.DB_PASSWORD }}
         run: |
           set -euo pipefail
-          CSV_PATH="${CSV_DIR}/${CSV_NAME}"
+          CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
 
-          # MySQL client must allow LOCAL INFILE on the client side
+          # MySQL client with LOCAL INFILE enabled
           MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} ${DB_NAME}"
 
-          # Staging table (drop/create). Edit column types/sizes to match your final schema.
-          $MYSQL_BASE <<'SQL'
-          DROP TABLE IF EXISTS stg_encar;
+          echo "MySQL ping/version:"
+          ${MYSQL_BASE} -e "SELECT VERSION();"
 
+          # Staging table (adjust types as needed)
+          ${MYSQL_BASE} <<'SQL'
+          DROP TABLE IF EXISTS stg_encar;
           CREATE TABLE stg_encar (
             prodhuesi        VARCHAR(80),
             modeli           VARCHAR(120),
@@ -137,10 +159,10 @@ jobs:
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
 
-          # Load CSV → staging (expects UTF-8, header row present)
-          $MYSQL_BASE --execute="SET SESSION local_infile=1;"
-          $MYSQL_BASE --execute="
-            LOAD DATA LOCAL INFILE '$(pwd)/${CSV_PATH}'
+          # Load CSV → staging (expects header row)
+          ${MYSQL_BASE} --execute="SET SESSION local_infile=1;"
+          ${MYSQL_BASE} --execute="
+            LOAD DATA LOCAL INFILE '${CSV_PATH}'
             INTO TABLE stg_encar
             CHARACTER SET utf8mb4
             FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
@@ -150,9 +172,8 @@ jobs:
              transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
           "
 
-          # Upsert into your real table `vehicles`. Adjust table/columns & unique key as needed.
-          # Assumes UNIQUE KEY on listing_url to prevent duplicates.
-          $MYSQL_BASE <<'SQL'
+          # Final table + unique key (adjust if you use a different key)
+          ${MYSQL_BASE} <<'SQL'
           CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;
           ALTER TABLE vehicles
             ADD UNIQUE KEY uniq_listing_url (listing_url(255));
