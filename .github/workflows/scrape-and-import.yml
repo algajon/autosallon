@@ -1,125 +1,183 @@
-name: Scrape & Import (hourly)
+name: Scrape & Import (Hostinger via SSH tunnel)
 
 on:
-  schedule:
-    - cron: "0 * * * *"   # every hour
   workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"   # run hourly at :17
+
+concurrency:
+  group: scrape-import
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+
+    env:
+      # Local tunnel endpoint the runner will use
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3307
+      # Where your scraper writes the CSV
+      CSV_DIR: ${{ secrets.CSV_DIR != '' && secrets.CSV_DIR || 'scripts' }}
+      CSV_NAME: cars.csv
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # --- Chrome + chromedriver for Selenium/Splinter ---
-      - name: Install Chrome & chromedriver
+      - name: Install system deps (MySQL client, SSH)
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb unzip curl jq mysql-client
-          wget -q "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
-          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get -f install -y
-          CHROME_MAJOR=$(google-chrome --version | sed -E 's/.* ([0-9]+)\..*/\1/')
-          DRIVER_TAG=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}")
-          curl -sSL -o /tmp/chromedriver.zip \
-            "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_TAG}/linux64/chromedriver-linux64.zip"
-          unzip -o /tmp/chromedriver.zip -d /tmp
-          sudo mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
-          sudo chmod +x /usr/local/bin/chromedriver
+          sudo apt-get install -y mysql-client openssh-client
 
-      - name: Install Python dependencies
-        run: |
-          pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install splinter selenium
-          fi
-
-      # --- SSH tunnel to Hostinger -> forwards MySQL to local port 3307 ---
+      # --- SSH key-only auth (no password) ---
       - name: Start SSH tunnel to Hostinger (MySQL)
+        id: tunnel
         env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}   # 46.202.156.167
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}   # 65002
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}   # u070377596
-          SSH_KEY:  ${{ secrets.HOSTINGER_SSH_KEY }}    # your *private* key block
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          SSH_KEY:  ${{ secrets.HOSTINGER_SSH_KEY }}
         run: |
-          set -e
-          mkdir -p ~/.ssh
-          # Write key safely and remove possible Windows CR characters
-          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
+          set -euo pipefail
+
+          # Write private key and harden perms
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-          # (Optional) derive the public key so you can install/compare it on Hostinger
-          ssh-keygen -y -f ~/.ssh/id_ed25519 > id_ed25519.pub
-          echo "Public key that must exist on Hostinger:"
-          cat id_ed25519.pub
+          # Strictly prefer key auth; never fall back to password
+          cat > ~/.ssh/config <<CFG
+          Host *
+            ServerAliveInterval 30
+            ServerAliveCountMax 3
+            IdentitiesOnly yes
+            PreferredAuthentications publickey
+            PasswordAuthentication no
+            StrictHostKeyChecking no
+          CFG
 
-          # Quick proof that SSH works (will fail here if the key isn't accepted)
-          ssh -vvv -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-          -p "$SSH_PORT" -i ~/.ssh/id_ed25519 "$SSH_USER@$SSH_HOST" 'echo SSH_OK'
+          # If your MySQL is local on the server use 127.0.0.1:3306 (default on Hostinger)
+          ssh -f -N \
+            -L ${DB_PORT}:127.0.0.1:3306 \
+            -p "${SSH_PORT}" \
+            "${SSH_USER}@${SSH_HOST}"
 
-          # Start the tunnel only if the above succeeded
-          ssh -f -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-            -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-            -p "$SSH_PORT" -i ~/.ssh/id_ed25519 \
-            -L 3307:127.0.0.1:3306 "$SSH_USER@$SSH_HOST"
-      # --- Run your scraper (works even if the script uses non-headless Chrome) ---
+          # Wait for the local tunnel to be ready
+          for i in {1..20}; do
+            if ss -lnt | grep -q ":${DB_PORT}"; then
+              echo "Tunnel up on port ${DB_PORT}"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "Tunnel did not open" >&2
+          exit 1
+
+      # --- Run your scraper (writes CSV to $CSV_DIR/$CSV_NAME) ---
+      # Adjust installs/command to your repo layout
+      - name: Install Python requirements
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # If your scraper needs extra libs, install them here as well.
+
       - name: Run scraper
         env:
-          DB_HOST: 127.0.0.1
-          DB_PORT: 3307
-          DB_DATABASE: ${{ secrets.DB_DATABASE }}
-          DB_USERNAME: ${{ secrets.DB_USERNAME }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          KRW_EUR:     ${{ secrets.KRW_EUR }}
-          CSV_DIR:     ${{ secrets.CSV_DIR }}
+          KRW_EUR: ${{ secrets.KRW_EUR }}
         run: |
-          export DISPLAY=:99
-          Xvfb :99 -screen 0 1920x1080x24 &  # allows non-headless Chrome
-          # your script writes scripts/cars.csv
-          python scripts/github.py
+          set -e
+          mkdir -p "$CSV_DIR"
+          # === Replace this line with your actual scraper entrypoint ===
+          # Example:
+          python scripts/encar_scraper.py
+          # ============================================================
+          test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found" >&2; exit 1)
 
-      # --- Import CSV into MySQL with upsert (avoid duplicate errors) ---
+      # --- Import CSV into MySQL over the tunnel ---
+      # This uses a staging table + upsert. Adjust table/columns to your schema.
       - name: Import CSV into MySQL (UPSERT)
         env:
-          DB_DATABASE: ${{ secrets.DB_DATABASE }}
-          DB_USERNAME: ${{ secrets.DB_USERNAME }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_DATABASE }}
+          DB_USER: ${{ secrets.DB_USERNAME }}
+          DB_PASS: ${{ secrets.DB_PASSWORD }}
         run: |
-          CSV="scripts/cars.csv"
-          test -f "$CSV" || { echo "CSV not found: $CSV"; exit 1; }
+          set -euo pipefail
+          CSV_PATH="${CSV_DIR}/${CSV_NAME}"
 
-          # Enable LOCAL INFILE
-          mysql -h 127.0.0.1 -P 3307 -u "$DB_USERNAME" -p"$DB_PASSWORD" -e "SET SESSION local_infile=1;"
+          # MySQL client must allow LOCAL INFILE on the client side
+          MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} ${DB_NAME}"
 
-          # Adjust table/columns to match your schema exactly:
-          mysql --local-infile=1 -h 127.0.0.1 -P 3307 -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" -e "
-            LOAD DATA LOCAL INFILE '$CSV'
-            INTO TABLE vehicles
-            FIELDS TERMINATED BY ',' ENCLOSED BY '\"'
+          # Staging table (drop/create). Edit column types/sizes to match your final schema.
+          $MYSQL_BASE <<'SQL'
+          DROP TABLE IF EXISTS stg_encar;
+
+          CREATE TABLE stg_encar (
+            prodhuesi        VARCHAR(80),
+            modeli           VARCHAR(120),
+            varianti         VARCHAR(160),
+            viti             VARCHAR(8),
+            cmimi_eur        INT,
+            kilometrazhi_km  INT,
+            karburanti       VARCHAR(40),
+            ngjyra           VARCHAR(40),
+            transmisioni     VARCHAR(40),
+            uleset           VARCHAR(8),
+            vin              VARCHAR(40),
+            engine_cc        INT,
+            images           TEXT,
+            listing_url      VARCHAR(512),
+            opsionet         MEDIUMTEXT,
+            raporti_url      TEXT
+          ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+          SQL
+
+          # Load CSV → staging (expects UTF-8, header row present)
+          $MYSQL_BASE --execute="SET SESSION local_infile=1;"
+          $MYSQL_BASE --execute="
+            LOAD DATA LOCAL INFILE '$(pwd)/${CSV_PATH}'
+            INTO TABLE stg_encar
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
             LINES TERMINATED BY '\n'
             IGNORE 1 LINES
             (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url)
-            SET updated_at = NOW()
-            ON DUPLICATE KEY UPDATE
-              cmimi_eur=VALUES(cmimi_eur),
-              kilometrazhi_km=VALUES(kilometrazhi_km),
-              karburanti=VALUES(karburanti),
-              ngjyra=VALUES(ngjyra),
-              transmisioni=VALUES(transmisioni),
-              uleset=VALUES(uleset),
-              engine_cc=VALUES(engine_cc),
-              images=VALUES(images),
-              opsionet=VALUES(opsionet),
-              raporti_url=VALUES(raporti_url),
-              updated_at=NOW();
+             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
           "
+
+          # Upsert into your real table `vehicles`. Adjust table/columns & unique key as needed.
+          # Assumes UNIQUE KEY on listing_url to prevent duplicates.
+          $MYSQL_BASE <<'SQL'
+          CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;
+          ALTER TABLE vehicles
+            ADD UNIQUE KEY uniq_listing_url (listing_url(255));
+          INSERT INTO vehicles (
+            prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+            transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
+          )
+          SELECT
+            prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+            transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
+          FROM stg_encar
+          ON DUPLICATE KEY UPDATE
+            prodhuesi=VALUES(prodhuesi),
+            modeli=VALUES(modeli),
+            varianti=VALUES(varianti),
+            viti=VALUES(viti),
+            cmimi_eur=VALUES(cmimi_eur),
+            kilometrazhi_km=VALUES(kilometrazhi_km),
+            karburanti=VALUES(karburanti),
+            ngjyra=VALUES(ngjyra),
+            transmisioni=VALUES(transmisioni),
+            uleset=VALUES(uleset),
+            vin=VALUES(vin),
+            engine_cc=VALUES(engine_cc),
+            images=VALUES(images),
+            opsionet=VALUES(opsionet),
+            raporti_url=VALUES(raporti_url);
+          SQL
