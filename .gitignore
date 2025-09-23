@@ -1,0 +1,40 @@
+# --- Laravel
+/vendor
+/node_modules
+/public/hot
+/public/storage
+/storage/*.key
+/.env
+/.env.*
+/storage/logs/*
+/storage/framework/cache/*
+/storage/framework/sessions/*
+/storage/framework/views/*
+/bootstrap/cache/*.php
+.phpunit.result.cache
+
+# IDE & OS
+/.idea
+/.vscode
+/.fleet
+.DS_Store
+
+# --- Frontend build noise
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Python scraper
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+logs/
+locks/
+out/
+scripts/out/
+scripts/*.csv
+.wdm/   # webdriver-manager cache (if present in repo)
