@@ -76,8 +76,15 @@ ON DUPLICATE KEY UPDATE
   raporti_url=VALUES(raporti_url);
 """
 # Exchange rate (KRW -> EUR). Override with:  KRW_EUR=0.00061 python ...
-KRW_EUR = float(os.getenv("KRW_EUR", "0.000615"))
+def getenv_float(name, default):
+    v = os.getenv(name, "")
+    try:
+        v = (v or "").strip().replace(",", ".")
+        return float(v) if v else float(default)
+    except Exception:
+        return float(default)
 
+KRW_EUR = getenv_float("KRW_EUR", 0.000615)
 FINISH_WORDS_RE = re.compile(
     r'\b(metallic|metal|met|pearl|pearlcoat|pearl\-coat|pearlized|pearly|pearl effect|'
     r'matte|matt|flat|satin|gloss|glossy|solid|standard|classic|premium|effect|'
