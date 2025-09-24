@@ -25,7 +25,7 @@ jobs:
       # Where your scraper writes the CSV
       CSV_DIR: ${{ secrets.CSV_DIR || 'scripts' }}
       CSV_NAME: cars.csv
-
+      KRW_EUR: ${{ secrets.KRW_EUR || '0.000615' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
