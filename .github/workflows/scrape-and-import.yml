@@ -3,7 +3,7 @@ name: Scrape & Import (Hostinger via SSH tunnel)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *" # run hourly at :17
+   # - cron: "17 * * * *" # run hourly at :17
 
 permissions:
   contents: read
