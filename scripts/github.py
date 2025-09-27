@@ -1835,12 +1835,18 @@ def main():
                         "raporti_url": alb["raporti_url"],
                     }
                     row_out = fill_blanks_in_row(row_out)
-                    upsert_vehicle(row_out)
                     if WRITE_DB:
+                    # sanity check so the scraper doesn't crash if creds are missing
+                    for v in ("DB_HOST","DB_PORT","DB_USERNAME","DB_PASSWORD","DB_DATABASE"):
+                        if not os.getenv(v):
+                            print(f"[skip-db] {v} is not set; skipping DB upsert")
+                            break
+                    else:
                         upsert_vehicle(row_out)
-                    total_done += 1
-                    row_index += 1
-                    print(f"✅ {total_done}/{MAX_LISTINGS} (page {current_page}, row {row_index})")
+
+                     total_done += 1
+                     row_index += 1
+                     print(f"✅ {total_done}/{MAX_LISTINGS} (page {current_page}, row {row_index})")
 
                 current_page += 1
                 _, tp = get_paging_info(browser)
