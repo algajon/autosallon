@@ -30,7 +30,7 @@ from selenium.common.exceptions import (
     NoAlertPresentException,
 )
 import pymysql
-
+import pathlib
 def db_conn():
     return pymysql.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
@@ -56,6 +56,7 @@ APP_ROOT = pathlib.Path(__file__).resolve().parent
 CSV_DIR  = os.getenv("CSV_DIR", str(APP_ROOT / "out"))
 os.makedirs(CSV_DIR, exist_ok=True)
 CSV_NAME = "cars.csv"
+WRITE_DB = os.getenv("WRITE_DB", "false").lower() in ("1", "true", "yes")
 
 UPSERT_SQL = """
 INSERT INTO vehicles
@@ -1835,7 +1836,8 @@ def main():
                     }
                     row_out = fill_blanks_in_row(row_out)
                     upsert_vehicle(row_out)
-
+                    if WRITE_DB:
+                        upsert_vehicle(row_out)
                     total_done += 1
                     row_index += 1
                     print(f"✅ {total_done}/{MAX_LISTINGS} (page {current_page}, row {row_index})")
