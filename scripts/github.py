@@ -1679,6 +1679,10 @@ def get_paging_info(browser):
     return page, total_pages
 
 # ---------------- Main ----------------
+import tempfile, shutil
+from contextlib import contextmanager
+
+@contextmanager
 def build_browser():
     opts = Options()
     opts.add_experimental_option("prefs", {
@@ -1686,7 +1690,8 @@ def build_browser():
         "translate_whitelists": {"ko": "en"},
         "translate": {"enabled": True},
     })
-    # Headless is important on CI
+
+    # Headless + CI-safe flags
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -1694,17 +1699,23 @@ def build_browser():
     opts.add_argument("--lang=en-US")
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
+    opts.add_argument("--disable-extensions")
 
-    # Give Chrome its own temp user data dir so it never collides
-    tmp_profile = tempfile.mkdtemp(prefix="encar-chrome-")
+    # Use a unique profile dir (prefer env from workflow if provided)
+    user_dir_env = os.getenv("CHROME_USER_DATA_DIR")
+    created_tmp = None
+    if user_dir_env:
+        tmp_profile = user_dir_env
+        os.makedirs(tmp_profile, exist_ok=True)
+    else:
+        created_tmp = tempfile.mkdtemp(prefix="encar-chrome-")
+        tmp_profile = created_tmp
+
     opts.add_argument(f"--user-data-dir={tmp_profile}")
-    # extra uniqueness within the profile
     opts.add_argument(f"--profile-directory=Profile-{os.getpid()}")
 
-    # if you want webdriver-manager:
-    # driver_path = ChromeDriverManager().install()
-    # br = Browser("chrome", options=opts, executable_path=driver_path)
-    br = Browser("chrome", options=opts)  # Selenium Manager will fetch a matching driver
+    # Start browser (let Selenium Manager fetch the driver)
+    br = Browser("chrome", options=opts)
 
     try:
         yield br
@@ -1713,7 +1724,9 @@ def build_browser():
             br.quit()
         except Exception:
             pass
-        shutil.rmtree(tmp_profile, ignore_errors=True)
+        if created_tmp:
+            shutil.rmtree(created_tmp, ignore_errors=True)
+
         
 def main():
     with build_browser() as browser:
