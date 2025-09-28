@@ -31,6 +31,8 @@ from selenium.common.exceptions import (
 )
 import pymysql
 import pathlib
+import tempfile, shutil
+from contextlib import contextmanager
 def db_conn():
     return pymysql.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
@@ -50,7 +52,7 @@ def upsert_vehicle(row):
             cur.execute(UPSERT_SQL, row)
 # ---------------- CONFIG ----------------
 BASE_URL = "https://www.encar.com/fc/fc_carsearchlist.do?carType=for#!%7B%22action%22%3A%22(And.Year.range(201500..)._.Hidden.N._.CarType.N._.SellType.%EC%9D%BC%EB%B0%98.)%22%2C%22toggle%22%3A%7B%224%22%3A0%7D%2C%22layer%22%3A%22%22%2C%22sort%22%3A%22ModifiedDate%22%2C%22page%22%3A1%2C%22limit%22%3A20%2C%22searchKey%22%3A%22%22%2C%22loginCheck%22%3Afalse%7D"
-MAX_LISTINGS = 20
+MAX_LISTINGS = 3
 PER_PAGE     = 20
 APP_ROOT = pathlib.Path(__file__).resolve().parent
 CSV_DIR  = os.getenv("CSV_DIR", str(APP_ROOT / "out"))
@@ -1684,15 +1686,35 @@ def build_browser():
         "translate_whitelists": {"ko": "en"},
         "translate": {"enabled": True},
     })
+    # Headless is important on CI
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--lang=en-US")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
 
-    driver_path = ChromeDriverManager().install()
-    return Browser("chrome", options=opts, headless=True, executable_path=driver_path)
+    # Give Chrome its own temp user data dir so it never collides
+    tmp_profile = tempfile.mkdtemp(prefix="encar-chrome-")
+    opts.add_argument(f"--user-data-dir={tmp_profile}")
+    # extra uniqueness within the profile
+    opts.add_argument(f"--profile-directory=Profile-{os.getpid()}")
 
+    # if you want webdriver-manager:
+    # driver_path = ChromeDriverManager().install()
+    # br = Browser("chrome", options=opts, executable_path=driver_path)
+    br = Browser("chrome", options=opts)  # Selenium Manager will fetch a matching driver
+
+    try:
+        yield br
+    finally:
+        try:
+            br.quit()
+        except Exception:
+            pass
+        shutil.rmtree(tmp_profile, ignore_errors=True)
+        
 def main():
     with build_browser() as browser:
         browser.visit(BASE_URL)
