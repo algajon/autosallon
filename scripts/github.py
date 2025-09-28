@@ -80,10 +80,14 @@ ON DUPLICATE KEY UPDATE
 def getenv_float(name, default):
     v = os.getenv(name, "")
     try:
-        v = (v or "").strip().replace(",", ".")
-        return float(v) if v else float(default)
+        s = (v or "").strip()
+        # keep only digits, dot/comma, exp markers, sign
+        s = re.sub(r"[^0-9,.\-+eE]", "", s)
+        s = s.replace(",", ".")
+        return float(s) if s else float(default)
     except Exception:
         return float(default)
+
 
 KRW_EUR = getenv_float("KRW_EUR", 0.000615)
 FINISH_WORDS_RE = re.compile(
@@ -1168,7 +1172,17 @@ def parse_title_brand_model_variant(title: str):
 
 def _coerce_float(x):
     try:
-        return float(str(x).replace(",", "").strip())
+        s = str(x).strip()
+        # remove everything except digits, dot, exp markers, sign
+        s = re.sub(r"[^0-9.\-+eE]", "", s)
+        # collapse thousands-like extra dots (e.g., 123.456.789 -> 123456789)
+        parts = s.split(".")
+        if len(parts) > 2:
+            s = parts[0] + "." + "".join(parts[1:])  # keep first dot as decimal
+            # If this still looks like an integer grouping case, fallback to removing all dots:
+            if not re.match(r"^-?\d+(\.\d+)?([eE][+-]?\d+)?$", s):
+                s = "".join(parts)  # no decimal; pure integer
+        return float(s)
     except:
         return None
 
@@ -1835,18 +1849,18 @@ def main():
                         "raporti_url": alb["raporti_url"],
                     }
                     row_out = fill_blanks_in_row(row_out)
-                    if WRITE_DB:
-                    # sanity check so the scraper doesn't crash if creds are missing
+                if WRITE_DB:
+                # sanity check so the scraper doesn't crash if creds are missing
                     for v in ("DB_HOST","DB_PORT","DB_USERNAME","DB_PASSWORD","DB_DATABASE"):
                         if not os.getenv(v):
                             print(f"[skip-db] {v} is not set; skipping DB upsert")
                             break
-                    else:
-                        upsert_vehicle(row_out)
+                else:
+                    upsert_vehicle(row_out)
 
-                     total_done += 1
-                     row_index += 1
-                     print(f"✅ {total_done}/{MAX_LISTINGS} (page {current_page}, row {row_index})")
+                total_done += 1
+                row_index += 1
+                print(f"✅ {total_done}/{MAX_LISTINGS} (page {current_page}, row {row_index})")
 
                 current_page += 1
                 _, tp = get_paging_info(browser)
