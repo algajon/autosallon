@@ -108,6 +108,10 @@ jobs:
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      - name: Clean stale Chrome (best-effort)
+        run: |
+          pkill -f chrome || true
+          pkill -f chromedriver || true
       - name: Run scraper
         env:
           KRW_EUR: ${{ secrets.KRW_EUR }}
@@ -115,8 +119,7 @@ jobs:
           set -e
           mkdir -p "$CSV_DIR"
           # === replace with your real entrypoint if different ===
-          pkill -f chrome || true
-          pkill -f chromedriver || true
+
           python scripts/github.py
           # ======================================================
           test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
