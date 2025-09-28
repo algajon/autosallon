@@ -115,7 +115,9 @@ jobs:
           set -e
           mkdir -p "$CSV_DIR"
           # === replace with your real entrypoint if different ===
-          python scripts/encar_scraper.py
+          pkill -f chrome || true
+          pkill -f chromedriver || true
+          python scripts/github.py
           # ======================================================
           test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
           ls -lh "${CSV_DIR}/${CSV_NAME}"
