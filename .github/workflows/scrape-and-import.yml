@@ -108,10 +108,15 @@ jobs:
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Clean stale Chrome (best-effort)
+      - name: Prepare unique Chrome profile dir
         run: |
-          pkill -f chrome || true
-          pkill -f chromedriver || true
+          echo "CHROME_USER_DATA_DIR=$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> $GITHUB_ENV
+          mkdir -p "$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      - name: Clean stale Chrome (best-effort)
+          run: |
+            pkill -f chrome || true
+            pkill -f chromedriver || true
       - name: Run scraper
         env:
           KRW_EUR: ${{ secrets.KRW_EUR }}
