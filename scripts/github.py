@@ -1682,7 +1682,6 @@ def get_paging_info(browser):
 import tempfile, shutil
 from contextlib import contextmanager
 
-@contextmanager
 def build_browser():
     opts = Options()
     opts.add_experimental_option("prefs", {
