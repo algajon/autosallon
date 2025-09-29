@@ -124,19 +124,35 @@ jobs:
         env:
           DB_NAME: ${{ secrets.DB_DATABASE }}
           DB_USER: ${{ secrets.DB_USERNAME }}
-          DB_PASS: ${{ secrets.MYSQL_PWD }}
+          DB_PASS: ${{ secrets.DB_PASSWORD }}
         run: |
           set -euo pipefail
+
+          [[ -n "${DB_NAME:-}" ]] || { echo "DB_NAME is empty/missing"; exit 1; }
+          [[ -n "${DB_USER:-}" ]] || { echo "DB_USER is empty/missing"; exit 1; }
+          [[ -n "${DB_PASS:-}" ]] || { echo "DB_PASS is empty/missing"; exit 1; }
+
+          CONF="$(mktemp)"
+          chmod 600 "$CONF"
+          cat > "$CONF" <<EOF
+          [client]
+          user=${DB_USER}
+          password=${DB_PASS}
+          host=${DB_HOST}
+          port=${DB_PORT}
+          database=${DB_NAME}
+          local-infile=1
+          protocol=TCP
+          EOF
+
           CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
-          MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} ${DB_NAME}"
+          MYSQL_BASE="mysql --defaults-extra-file=$CONF"
 
           echo "MySQL ping/version:"
-          ${MYSQL_BASE} -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, @@skip_name_resolve AS skip_name_resolve;"
+    
+          $MYSQL_BASE -e "SELECT VERSION() AS version, @@skip_name_resolve AS skip_name_resolve;"
 
-          echo "MySQL ping/version:"
-          ${MYSQL_BASE} -e "SELECT VERSION();"
-          # Staging table (adjust types as needed)
-          ${MYSQL_BASE} <<'SQL'
+          $MYSQL_BASE <<'SQL'
           DROP TABLE IF EXISTS stg_encar;
           CREATE TABLE stg_encar (
             prodhuesi        VARCHAR(80),
@@ -157,30 +173,29 @@ jobs:
             raporti_url      TEXT
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
-          # Load CSV → staging (expects header row)
-          ${MYSQL_BASE} --execute="SET SESSION local_infile=1;"
-          ${MYSQL_BASE} --execute="
-            LOAD DATA LOCAL INFILE '${CSV_PATH}'
-            INTO TABLE stg_encar
-            CHARACTER SET utf8mb4
-            FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
-            LINES TERMINATED BY '\n'
-            IGNORE 1 LINES
-            (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
+
+          $MYSQL_BASE --execute="
+          LOAD DATA LOCAL INFILE '${CSV_PATH}'
+          INTO TABLE stg_encar
+          CHARACTER SET utf8mb4
+          FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
+          LINES TERMINATED BY '\n'
+          IGNORE 1 LINES
+          (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+           transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
           "
-          # Final table + unique key (adjust if you use a different key)
-          ${MYSQL_BASE} <<'SQL'
+
+          $MYSQL_BASE <<'SQL'
           CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;
           ALTER TABLE vehicles
-            ADD UNIQUE KEY uniq_listing_url (listing_url(255));
+          ADD UNIQUE KEY uniq_listing_url (listing_url(255));
           INSERT INTO vehicles (
             prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
           )
           SELECT
-            prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-            transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
+          prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+          transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
           FROM stg_encar
           ON DUPLICATE KEY UPDATE
             prodhuesi=VALUES(prodhuesi),
@@ -199,3 +214,5 @@ jobs:
             opsionet=VALUES(opsionet),
             raporti_url=VALUES(raporti_url);
           SQL
+
+          shred -u "$CONF" || rm -f "$CONF"
