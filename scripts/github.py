@@ -1678,11 +1678,15 @@ def get_paging_info(browser):
         pass
     return page, total_pages
 
-# ---------------- Main ----------------
-import tempfile, shutil
-from contextlib import contextmanager
 
+
+@contextmanager
 def build_browser():
+    """
+    Context-managed browser that uses a unique Chrome profile each run.
+    In CI, this avoids 'user data dir in use' errors.
+    If CHROME_USER_DATA_DIR is set, it will reuse that directory and NOT delete it.
+    """
     opts = Options()
     opts.add_experimental_option("prefs", {
         "intl.accept_languages": "en-US,en",
@@ -1700,7 +1704,7 @@ def build_browser():
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-extensions")
 
-    # Use a unique profile dir (prefer env from workflow if provided)
+    # Unique profile dir (prefer env from workflow if provided)
     user_dir_env = os.getenv("CHROME_USER_DATA_DIR")
     created_tmp = None
     if user_dir_env:
@@ -1711,9 +1715,10 @@ def build_browser():
         tmp_profile = created_tmp
 
     opts.add_argument(f"--user-data-dir={tmp_profile}")
+    # also set a unique profile directory inside the user-data-dir
     opts.add_argument(f"--profile-directory=Profile-{os.getpid()}")
 
-    # Start browser (let Selenium Manager fetch the driver)
+    # Start browser (Selenium Manager will fetch driver)
     br = Browser("chrome", options=opts)
 
     try:
@@ -1723,10 +1728,11 @@ def build_browser():
             br.quit()
         except Exception:
             pass
+        # Only delete the temp dir if we created it
         if created_tmp:
             shutil.rmtree(created_tmp, ignore_errors=True)
 
-        
+
 def main():
     with build_browser() as browser:
         browser.visit(BASE_URL)
@@ -1828,10 +1834,12 @@ def main():
                         raw = scrape_detail_raw(browser)
                         try:
                             browser.windows.current.close()
-                        except: pass
+                        except:
+                            pass
                         try:
                             browser.windows[0].is_current = True
-                        except: pass
+                        except:
+                            pass
                         time.sleep(0.2)
                     else:
                         raw = {
@@ -1883,24 +1891,28 @@ def main():
                         "raporti_url": alb["raporti_url"],
                     }
                     row_out = fill_blanks_in_row(row_out)
-                if WRITE_DB:
-                # sanity check so the scraper doesn't crash if creds are missing
-                    for v in ("DB_HOST","DB_PORT","DB_USERNAME","DB_PASSWORD","DB_DATABASE"):
-                        if not os.getenv(v):
-                            print(f"[skip-db] {v} is not set; skipping DB upsert")
-                            break
-                else:
-                    upsert_vehicle(row_out)
 
-                total_done += 1
-                row_index += 1
-                print(f"✅ {total_done}/{MAX_LISTINGS} (page {current_page}, row {row_index})")
+                    # ✅ Correct WRITE_DB logic
+                    if WRITE_DB:
+                        missing = [v for v in ("DB_HOST","DB_PORT","DB_USERNAME","DB_PASSWORD","DB_DATABASE") if not os.getenv(v)]
+                        if missing:
+                            print(f"[skip-db] missing {', '.join(missing)}; skipping DB upsert")
+                        else:
+                            upsert_vehicle(row_out)
+
+                    # write the CSV row regardless of DB
+                    writer.writerow(row_out)
+
+                    total_done += 1
+                    row_index += 1
+                    print(f"✅ {total_done}/{MAX_LISTINGS} (page {current_page}, row {row_index})")
 
                 current_page += 1
                 _, tp = get_paging_info(browser)
                 total_pages = tp or total_pages
 
         print(f"🎯 Finished. Saved to {csv_path}")
+
 
 if __name__ == "__main__":
     main()
