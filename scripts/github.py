@@ -1683,11 +1683,12 @@ def get_paging_info(browser):
 @contextmanager
 def build_browser():
     """
-    Use a unique Chrome profile per run to avoid:
-    'session not created: ... user data directory is already in use'
+    One unique Chrome profile per run.
+    No headless=False, no shared user-data-dir.
     """
     opts = Options()
-    # Headless + CI-safe
+
+    # Headless + CI-safe flags
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -1704,26 +1705,15 @@ def build_browser():
         "translate": {"enabled": True},
     })
 
-    # Create a unique, *clean* profile dir each run (or use a unique one from env)
-    created_tmp = None
-    user_dir = os.getenv("CHROME_USER_DATA_DIR")
-    if user_dir:
-        os.makedirs(user_dir, exist_ok=True)
-        profile_dir = user_dir
-        created_tmp = None
-    else:
-        profile_dir = tempfile.mkdtemp(prefix="encar-chrome-")
-        created_tmp = profile_dir
-
+    # ALWAYS use a unique, throwaway user-data-dir
+    profile_dir = tempfile.mkdtemp(prefix=f"encar-chrome-{uuid.uuid4().hex[:8]}-")
+    cache_dir   = tempfile.mkdtemp(prefix=f"encar-cache-{uuid.uuid4().hex[:8]}-")
     opts.add_argument(f"--user-data-dir={profile_dir}")
-    # unique profile name inside the user-data-dir
-    opts.add_argument(f"--profile-directory=Profile-{os.getpid()}")
-    # isolate cache too (optional but helps on parallel runners)
-    cache_dir = tempfile.mkdtemp(prefix="encar-cache-")
+    opts.add_argument(f"--profile-directory=Profile-Default")
     opts.add_argument(f"--disk-cache-dir={cache_dir}")
 
-    # IMPORTANT: do NOT pass headless=False here
-    br = Browser("chrome", options=opts)  # Selenium Manager fetches chromedriver
+    # DO NOT pass headless=False here – we already set headless via opts
+    br = Browser("chrome", options=opts)
 
     try:
         yield br
@@ -1732,10 +1722,9 @@ def build_browser():
             br.quit()
         except Exception:
             pass
-        if created_tmp:
-            shutil.rmtree(created_tmp, ignore_errors=True)
-        shutil.rmtree(cache_dir, ignore_errors=True)
-
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        shutil.rmtree(cache_dir,   ignore_errors=True)
+        
 def main():
     with build_browser() as browser:
         browser.visit(BASE_URL)
