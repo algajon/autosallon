@@ -18,12 +18,9 @@ jobs:
     timeout-minutes: 45
 
     env:
-      # Local endpoint for the SSH tunnel on the runner
+      # Local endpoint on the runner
       TUNNEL_HOST: 127.0.0.1
       TUNNEL_PORT: 3307
-
-      # Remote MySQL host seen from the SSH box (often 127.0.0.1)
-      REMOTE_DB_HOST: ${{ secrets.REMOTE_DB_HOST != '' && secrets.REMOTE_DB_HOST || '127.0.0.1' }}
 
       # Scraper output
       CSV_DIR: ${{ secrets.CSV_DIR != '' && secrets.CSV_DIR || 'scripts' }}
@@ -53,12 +50,10 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          # Fail early if key is invalid or passphrase-protected
           if ! ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null 2>&1; then
             echo "The private key in HOSTINGER_SSH_KEY appears invalid or passphrase-protected."
             exit 1
           fi
-          # SSH client defaults (force key-only)
           cat > ~/.ssh/config <<'CFG'
           Host *
             ServerAliveInterval 30
@@ -71,7 +66,7 @@ jobs:
 
       - name: Try SSH auth once (verbose)
         env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}   # 46.202.156.167
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
         run: |
@@ -79,13 +74,13 @@ jobs:
           ssh -vvv -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
               -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'Auth OK'; exit"
 
+      # IMPORTANT: forward to srv1802.hstgr.io:3306 so Hostinger sees source IP = 46.202.156.167
       - name: Start SSH tunnel (runner:3307 → 46.202.156.167 → srv1802.hstgr.io:3306)
         env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}   # set to 46.202.156.167
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}   # 46.202.156.167
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          REMOTE_DB_HOST: ${{ secrets.REMOTE_DB_HOST != '' && secrets.REMOTE_DB_HOST || 'srv1802.hstgr.io' }}
-          TUNNEL_PORT: 3307
+          REMOTE_DB_HOST: srv1802.hstgr.io
         run: |
           set -euo pipefail
           ssh -f -N \
@@ -93,8 +88,6 @@ jobs:
             -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
             -L ${TUNNEL_PORT}:${REMOTE_DB_HOST}:3306 \
             -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
-
-          # Wait for tunnel
           for i in {1..20}; do
             if ss -lnt | grep -q ":${TUNNEL_PORT}"; then
               echo "Tunnel up on ${TUNNEL_PORT} -> ${REMOTE_DB_HOST}:3306 via ${SSH_HOST}"
@@ -133,40 +126,11 @@ jobs:
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
       # --- Import CSV into MySQL over the tunnel ---
-      # --- TUNNEL (runner:3307 → 46.202.156.167 → srv1802.hstgr.io:3306) ---
-      - name: Start SSH tunnel
-        env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}   # 46.202.156.167
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          TUNNEL_PORT: 3307
-          REMOTE_DB_HOST: ${{ secrets.REMOTE_DB_HOST }} # srv1802.hstgr.io
-        run: |
-          set -euo pipefail
-          ssh -f -N \
-            -o ExitOnForwardFailure=yes \
-            -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-            -L ${TUNNEL_PORT}:${REMOTE_DB_HOST}:3306 \
-            -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
-          # Wait for tunnel
-          for i in {1..20}; do
-            if ss -lnt | grep -q ":${TUNNEL_PORT}"; then
-              echo "Tunnel up on ${TUNNEL_PORT} -> ${REMOTE_DB_HOST}:3306 via ${SSH_HOST}"
-              exit 0
-            fi
-            sleep 0.5
-          done
-          echo "Tunnel did not open" >&2
-          exit 1
-
-      # --- IMPORT (force mysql to read creds; verify; then run) ---
       - name: Import CSV into MySQL (UPSERT)
         env:
           DB_DATABASE: ${{ secrets.DB_DATABASE }}
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD != '' && secrets.DB_PASSWORD || secrets.MYSQL_PWD }}
-          CSV_DIR: ${{ env.CSV_DIR }}
-          CSV_NAME: ${{ env.CSV_NAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           set -euo pipefail
           [[ -n "${DB_DATABASE:-}" ]] || { echo "DB_DATABASE missing"; exit 1; }
@@ -175,31 +139,13 @@ jobs:
 
           CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
 
-          # Strict client option file; must be FIRST arg on every mysql call
-          CONF="$(mktemp)"; chmod 600 "$CONF"
-          {
-            printf "[client]\n"
-            printf "user=%s\n"      "$DB_USERNAME"
-            printf "password=%s\n"  "$DB_PASSWORD"
-            printf "host=%s\n"      "127.0.0.1"
-            printf "port=%s\n"      "3307"
-            printf "database=%s\n"  "$DB_DATABASE"
-            printf "local-infile=1\n"
-            printf "protocol=TCP\n"
-            # If Hostinger requires SSL: uncomment next line
-            # printf "ssl-mode=REQUIRED\n"
-          } > "$CONF"
-
-          # Prove the file is read (password masked as ******)
-          mysql --defaults-file="$CONF" --print-defaults
-          mysql --defaults-file="$CONF" --print-defaults | grep -q -- "--user=" \
-            || { echo "defaults-file not applied"; sed -E 's/(password=).*/\1******/' "$CONF"; exit 1; }
-
+          # 1) Prove creds are used (expect 'using password: YES' if they reach server)
           echo "MySQL ping/version:"
-          mysql --defaults-file="$CONF" -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user, @@skip_name_resolve AS skip_name_resolve;"
+          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" \
+                -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;" "${DB_DATABASE}"
 
-          # Staging table
-          mysql --defaults-file="$CONF" <<'SQL'
+          # 2) Staging table
+          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" "${DB_DATABASE}" <<'SQL'
           DROP TABLE IF EXISTS stg_encar;
           CREATE TABLE stg_encar (
             prodhuesi        VARCHAR(80),
@@ -221,8 +167,8 @@ jobs:
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
 
-          # Load CSV → staging
-          mysql --defaults-file="$CONF" --execute="
+          # 3) Load CSV → staging
+          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" --execute="
             SET SESSION local_infile=1;
             LOAD DATA LOCAL INFILE '${CSV_PATH}'
             INTO TABLE stg_encar
@@ -232,19 +178,22 @@ jobs:
             IGNORE 1 LINES
             (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
              transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
-          "
+          " "${DB_DATABASE}"
 
-          # Ensure final table + index (idempotent)
-          mysql --defaults-file="$CONF" -e "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;"
-          HAS_IDX="$(mysql --defaults-file="$CONF" -N -B -e \
+          # 4) Ensure final table + unique index (idempotent)
+          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" -e \
+            "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "${DB_DATABASE}"
+
+          HAS_IDX="$(mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" -N -B -e \
             "SELECT COUNT(1) FROM information_schema.statistics
-             WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url';")"
+             WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url';" "${DB_DATABASE}")"
           if [ "$HAS_IDX" -eq 0 ]; then
-            mysql --defaults-file="$CONF" -e "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));"
+            mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" -e \
+              "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "${DB_DATABASE}"
           fi
 
-          # Upsert
-          mysql --defaults-file="$CONF" <<'SQL'
+          # 5) Upsert
+          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" "${DB_DATABASE}" <<'SQL'
           INSERT INTO vehicles (
             prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
@@ -270,5 +219,3 @@ jobs:
             opsionet=VALUES(opsionet),
             raporti_url=VALUES(raporti_url);
           SQL
-
-          shred -u "$CONF" || rm -f "$CONF"
