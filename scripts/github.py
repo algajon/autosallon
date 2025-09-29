@@ -1683,18 +1683,11 @@ def get_paging_info(browser):
 @contextmanager
 def build_browser():
     """
-    Context-managed browser that uses a unique Chrome profile each run.
-    In CI, this avoids 'user data dir in use' errors.
-    If CHROME_USER_DATA_DIR is set, it will reuse that directory and NOT delete it.
+    Use a unique Chrome profile per run to avoid:
+    'session not created: ... user data directory is already in use'
     """
     opts = Options()
-    opts.add_experimental_option("prefs", {
-        "intl.accept_languages": "en-US,en",
-        "translate_whitelists": {"ko": "en"},
-        "translate": {"enabled": True},
-    })
-
-    # Headless + CI-safe flags
+    # Headless + CI-safe
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -1704,22 +1697,33 @@ def build_browser():
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-extensions")
 
-    # Unique profile dir (prefer env from workflow if provided)
-    user_dir_env = os.getenv("CHROME_USER_DATA_DIR")
+    # Auto-translate KR -> EN
+    opts.add_experimental_option("prefs", {
+        "intl.accept_languages": "en-US,en",
+        "translate_whitelists": {"ko": "en"},
+        "translate": {"enabled": True},
+    })
+
+    # Create a unique, *clean* profile dir each run (or use a unique one from env)
     created_tmp = None
-    if user_dir_env:
-        tmp_profile = user_dir_env
-        os.makedirs(tmp_profile, exist_ok=True)
+    user_dir = os.getenv("CHROME_USER_DATA_DIR")
+    if user_dir:
+        os.makedirs(user_dir, exist_ok=True)
+        profile_dir = user_dir
+        created_tmp = None
     else:
-        created_tmp = tempfile.mkdtemp(prefix="encar-chrome-")
-        tmp_profile = created_tmp
+        profile_dir = tempfile.mkdtemp(prefix="encar-chrome-")
+        created_tmp = profile_dir
 
-    opts.add_argument(f"--user-data-dir={tmp_profile}")
-    # also set a unique profile directory inside the user-data-dir
+    opts.add_argument(f"--user-data-dir={profile_dir}")
+    # unique profile name inside the user-data-dir
     opts.add_argument(f"--profile-directory=Profile-{os.getpid()}")
+    # isolate cache too (optional but helps on parallel runners)
+    cache_dir = tempfile.mkdtemp(prefix="encar-cache-")
+    opts.add_argument(f"--disk-cache-dir={cache_dir}")
 
-    # Start browser (Selenium Manager will fetch driver)
-    br = Browser("chrome", options=opts)
+    # IMPORTANT: do NOT pass headless=False here
+    br = Browser("chrome", options=opts)  # Selenium Manager fetches chromedriver
 
     try:
         yield br
@@ -1728,10 +1732,9 @@ def build_browser():
             br.quit()
         except Exception:
             pass
-        # Only delete the temp dir if we created it
         if created_tmp:
             shutil.rmtree(created_tmp, ignore_errors=True)
-
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 def main():
     with build_browser() as browser:
