@@ -1,123 +1,138 @@
+name: Scrape & Import (Hostinger via SSH tunnel)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *" # run hourly at :17
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scrape-import
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # Local endpoint for the SSH tunnel (runner side)
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3307
+
+      # Where your scraper writes the CSV
+      CSV_DIR: ${{ secrets.CSV_DIR || 'scripts' }}
+      CSV_NAME: cars.csv
+      KRW_EUR: ${{ secrets.KRW_EUR != '' && secrets.KRW_EUR || '0.000615' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps (MySQL client, SSH)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client openssh-client
+      # --- SSH key-only auth (no password fallback) ---
+      - name: Prepare SSH key (key-only; no password)
+        id: prep-ssh
+        env:
+          SSH_KEY:  ${{ secrets.HOSTINGER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Fail early if key is invalid or passphrase-protected
+          if ! ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null 2>&1; then
+            echo "The private key in HOSTINGER_SSH_KEY appears invalid or passphrase-protected."
+            exit 1
+          fi
+          # SSH client defaults (force key-only)
+          cat > ~/.ssh/config <<'CFG'
+          Host *
+            ServerAliveInterval 30
+            ServerAliveCountMax 3
+            IdentitiesOnly yes
+            PreferredAuthentications publickey
+            PasswordAuthentication no
+            StrictHostKeyChecking no
+          CFG
+      - name: Try SSH auth once (verbose)
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+        run: |
+          set -e
+          ssh -vvv -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
+              -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'Auth OK'; exit"
       - name: Start SSH tunnel to Hostinger (MySQL)
         env:
           SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
           DB_PORT:  ${{ env.DB_PORT }}
-          REMOTE_DB_HOST: ${{ env.REMOTE_DB_HOST }}
         run: |
           set -euo pipefail
-          if [ -z "${REMOTE_DB_HOST}" ]; then
-            echo "REMOTE_DB_HOST secret is empty. Set it to your MySQL host (often NOT the SSH host)." >&2
-            exit 1
-          fi
           ssh -f -N \
             -o ExitOnForwardFailure=yes \
             -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-            -L ${DB_PORT}:${REMOTE_DB_HOST}:3306 \
+            -L ${DB_PORT}:127.0.0.1:3306 \
             -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
-
+          # Wait for tunnel
           for i in {1..20}; do
             if ss -lnt | grep -q ":${DB_PORT}"; then
-              echo "Tunnel up on port ${DB_PORT} → ${REMOTE_DB_HOST}:3306"
+              echo "Tunnel up on port ${DB_PORT}"
               exit 0
             fi
             sleep 0.5
           done
           echo "Tunnel did not open" >&2
           exit 1
-
-      # ✅ Wait for MySQL over the tunnel (no password warning)
-      - name: Wait for MySQL over tunnel
-        env:
-          DB_USER: ${{ secrets.DB_USERNAME }}
-          DB_PASS: ${{ secrets.DB_PASSWORD }}
-          DB_HOST: ${{ env.DB_HOST }}
-          DB_PORT: ${{ env.DB_PORT }}
-        run: |
-          set -euo pipefail
-          for i in {1..30}; do
-            if MYSQL_PWD="$DB_PASS" mysqladmin \
-                 --protocol=TCP -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" \
-                 ping --silent; then
-              echo "MySQL reachable over tunnel"
-              exit 0
-            fi
-            echo "Waiting for MySQL ($i/30)…"
-            sleep 2
-          done
-          echo "MySQL not reachable" >&2
-          exit 1
-
-      # ✅ NOW check MySQL auth (AFTER tunnel)
-      - name: Check MySQL auth over tunnel
-        env:
-          DB_NAME: ${{ secrets.DB_DATABASE }}
-          DB_USER: ${{ secrets.DB_USERNAME }}
-          DB_PASS: ${{ secrets.DB_PASSWORD }}
-          DB_HOST: ${{ env.DB_HOST }}
-          DB_PORT: ${{ env.DB_PORT }}
-        run: |
-          set -euo pipefail
-          export MYSQL_PWD="${DB_PASS}"
-          echo "Trying to connect to ${DB_HOST}:${DB_PORT} as ${DB_USER} (DB: ${DB_NAME})"
-          mysql --protocol=TCP -h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}" -e "SELECT CURRENT_USER() AS who, VERSION() AS ver;"
-          mysql --protocol=TCP -h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}" -e "SHOW DATABASES;"
-          mysql --protocol=TCP -h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}" -e "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';"
-
       # --- Run your scraper (writes CSV to $CSV_DIR/$CSV_NAME) ---
       - name: Install Python requirements
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
       - name: Prepare unique Chrome profile dir
         run: |
           echo "CHROME_USER_DATA_DIR=$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> $GITHUB_ENV
           mkdir -p "$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
       - name: Clean stale Chrome (best-effort)
-        run: |
-          pkill -f chrome || true
-          pkill -f chromedriver || true
-
+        run: |            
+            pkill -f chrome || true
+            pkill -f chromedriver || true
       - name: Run scraper
         env:
           KRW_EUR: ${{ secrets.KRW_EUR }}
-          CHROME_USER_DATA_DIR: ${{ runner.temp }}/chrome-${{ github.run_id }}-${{ github.job }}-${{ github.run_attempt }}-${{ strategy.job-index }}
         run: |
           set -e
           mkdir -p "$CSV_DIR"
+          # === replace with your real entrypoint if different ===
           python scripts/github.py
+          # ======================================================
           test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
           ls -lh "${CSV_DIR}/${CSV_NAME}"
-
-      # 📦 Upload CSV artifact so you can view it even if import fails
-      - name: Upload CSV artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: scraped-cars
-          path: ${{ env.CSV_DIR }}/${{ env.CSV_NAME }}
-          if-no-files-found: error
-          retention-days: 7
-
       # --- Import CSV into MySQL over the tunnel ---
       - name: Import CSV into MySQL (UPSERT)
         env:
           DB_NAME: ${{ secrets.DB_DATABASE }}
           DB_USER: ${{ secrets.DB_USERNAME }}
           DB_PASS: ${{ secrets.DB_PASSWORD }}
-          DB_HOST: ${{ env.DB_HOST }}
-          DB_PORT: ${{ env.DB_PORT }}
         run: |
           set -euo pipefail
           CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
-          export MYSQL_PWD="${DB_PASS}"
-
-          MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} ${DB_NAME}"
-
+          # MySQL client with LOCAL INFILE enabled
+          MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} ${DB_NAME}"
           echo "MySQL ping/version:"
           ${MYSQL_BASE} -e "SELECT VERSION();"
-
+          # Staging table (adjust types as needed)
           ${MYSQL_BASE} <<'SQL'
           DROP TABLE IF EXISTS stg_encar;
           CREATE TABLE stg_encar (
@@ -139,7 +154,7 @@
             raporti_url      TEXT
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
-
+          # Load CSV → staging (expects header row)
           ${MYSQL_BASE} --execute="SET SESSION local_infile=1;"
           ${MYSQL_BASE} --execute="
             LOAD DATA LOCAL INFILE '${CSV_PATH}'
@@ -151,7 +166,7 @@
             (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
              transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
           "
-
+          # Final table + unique key (adjust if you use a different key)
           ${MYSQL_BASE} <<'SQL'
           CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;
           ALTER TABLE vehicles
@@ -181,20 +196,3 @@
             opsionet=VALUES(opsionet),
             raporti_url=VALUES(raporti_url);
           SQL
-
-      # 🧯 If import fails, dump grants & user host for quick diagnosis
-      - name: On failure: Show user/host grants
-        if: failure()
-        env:
-          DB_NAME: ${{ secrets.DB_DATABASE }}
-          DB_USER: ${{ secrets.DB_USERNAME }}
-          DB_PASS: ${{ secrets.DB_PASSWORD }}
-          DB_HOST: ${{ env.DB_HOST }}
-          DB_PORT: ${{ env.DB_PORT }}
-        run: |
-          set -euo pipefail
-          export MYSQL_PWD="${DB_PASS}"
-          echo "Who am I?"
-          mysql --protocol=TCP -h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}" -e "SELECT CURRENT_USER() AS who, USER() AS user;"
-          echo "Show matching accounts for this username:"
-          mysql --protocol=TCP -h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}" -e "SELECT user, host FROM mysql.user WHERE user='${DB_USER}'\G" || true
