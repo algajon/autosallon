@@ -21,7 +21,7 @@ jobs:
       # Local endpoint for the SSH tunnel (runner side)
       DB_HOST: 127.0.0.1
       DB_PORT: 3307
-
+      REMOTE_DB_HOST: ${{ secrets.REMOTE_DB_HOST }}
       # Where your scraper writes the CSV
       CSV_DIR: ${{ secrets.CSV_DIR || 'scripts' }}
       CSV_NAME: cars.csv
@@ -85,21 +85,25 @@ jobs:
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
           DB_PORT:  ${{ env.DB_PORT }}
+          REMOTE_DB_HOST: ${{ env.REMOTE_DB_HOST }}
         run: |
           set -euo pipefail
+          if [ -z "${REMOTE_DB_HOST}" ]; then
+          echo "REMOTE_DB_HOST secret is empty. Set it to your MySQL host (often NOT the SSH host)." >&2
+          exit 1
+          fi
           ssh -f -N \
-            -o ExitOnForwardFailure=yes \
-            -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-            -L ${DB_PORT}:127.0.0.1:3306 \
-            -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
+          -o ExitOnForwardFailure=yes \
+          -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
+          -L ${DB_PORT}:${REMOTE_DB_HOST}:3306 \
+          -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
 
-          # Wait for local port to open
           for i in {1..20}; do
-            if ss -lnt | grep -q ":${DB_PORT}"; then
-              echo "Tunnel up on port ${DB_PORT}"
-              exit 0
-            fi
-            sleep 0.5
+          if ss -lnt | grep -q ":${DB_PORT}"; then
+            echo "Tunnel up on port ${DB_PORT}"
+          exit 0
+          fi
+          sleep 0.5
           done
           echo "Tunnel did not open" >&2
           exit 1
