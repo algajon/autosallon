@@ -124,12 +124,15 @@ jobs:
         env:
           DB_NAME: ${{ secrets.DB_DATABASE }}
           DB_USER: ${{ secrets.DB_USERNAME }}
-          DB_PASS: ${{ secrets.DB_PASSWORD }}
+          DB_PASS: ${{ secrets.MYSQL_PWD }}
         run: |
           set -euo pipefail
           CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
-          # MySQL client with LOCAL INFILE enabled
-          MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} ${DB_NAME}"
+          MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} ${DB_NAME}"
+
+          echo "MySQL ping/version:"
+          ${MYSQL_BASE} -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, @@skip_name_resolve AS skip_name_resolve;"
+
           echo "MySQL ping/version:"
           ${MYSQL_BASE} -e "SELECT VERSION();"
           # Staging table (adjust types as needed)
