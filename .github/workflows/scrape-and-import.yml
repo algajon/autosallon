@@ -26,6 +26,7 @@ jobs:
       CSV_DIR: ${{ secrets.CSV_DIR || 'scripts' }}
       CSV_NAME: cars.csv
       KRW_EUR: ${{ secrets.KRW_EUR != '' && secrets.KRW_EUR || '0.000615' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,7 +93,7 @@ jobs:
             -L ${DB_PORT}:127.0.0.1:3306 \
             -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
 
-          # Wait for tunnel
+          # Wait for local port to open
           for i in {1..20}; do
             if ss -lnt | grep -q ":${DB_PORT}"; then
               echo "Tunnel up on port ${DB_PORT}"
@@ -101,6 +102,28 @@ jobs:
             sleep 0.5
           done
           echo "Tunnel did not open" >&2
+          exit 1
+
+      # ✅ NEW: Wait for MySQL over the tunnel (no password warning)
+      - name: Wait for MySQL over tunnel
+        env:
+          DB_USER: ${{ secrets.DB_USERNAME }}
+          DB_PASS: ${{ secrets.DB_PASSWORD }}
+          DB_HOST: ${{ env.DB_HOST }}
+          DB_PORT: ${{ env.DB_PORT }}
+        run: |
+          set -euo pipefail
+          for i in {1..30}; do
+            if MYSQL_PWD="$DB_PASS" mysqladmin \
+                 --protocol=TCP -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" \
+                 ping --silent; then
+              echo "MySQL reachable over tunnel"
+              exit 0
+            fi
+            echo "Waiting for MySQL ($i/30)…"
+            sleep 2
+          done
+          echo "MySQL not reachable" >&2
           exit 1
 
       # --- Run your scraper (writes CSV to $CSV_DIR/$CSV_NAME) ---
@@ -117,19 +140,15 @@ jobs:
         run: |
           pkill -f chrome || true
           pkill -f chromedriver || true
-            
+
       - name: Run scraper
         env:
           KRW_EUR: ${{ secrets.KRW_EUR }}
           CHROME_USER_DATA_DIR: ${{ runner.temp }}/chrome-${{ github.run_id }}-${{ github.job }}-${{ github.run_attempt }}-${{ strategy.job-index }}
-
         run: |
           set -e
           mkdir -p "$CSV_DIR"
-          # === replace with your real entrypoint if different ===
-
           python scripts/github.py
-          # ======================================================
           test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
@@ -139,12 +158,16 @@ jobs:
           DB_NAME: ${{ secrets.DB_DATABASE }}
           DB_USER: ${{ secrets.DB_USERNAME }}
           DB_PASS: ${{ secrets.DB_PASSWORD }}
+          DB_HOST: ${{ env.DB_HOST }}
+          DB_PORT: ${{ env.DB_PORT }}
         run: |
           set -euo pipefail
           CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
 
-          # MySQL client with LOCAL INFILE enabled
-          MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} ${DB_NAME}"
+          # Use MYSQL_PWD to avoid the CLI password warning
+          export MYSQL_PWD="${DB_PASS}"
+
+          MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} ${DB_NAME}"
 
           echo "MySQL ping/version:"
           ${MYSQL_BASE} -e "SELECT VERSION();"
