@@ -78,7 +78,25 @@ jobs:
           set -e
           ssh -vvv -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
               -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'Auth OK'; exit"
+      - name: Check MySQL auth over tunnel
+        env:
+          DB_NAME: ${{ secrets.DB_DATABASE }}
+          DB_USER: ${{ secrets.DB_USERNAME }}
+          DB_PASS: ${{ secrets.DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          MYSQL_BASE="mysql --protocol=TCP --local-infile=1 -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS}"
 
+          echo "Trying to connect to ${DB_HOST}:${DB_PORT} as ${DB_USER} (DB: ${DB_NAME})"
+          if ! ${MYSQL_BASE} -e "SELECT CURRENT_USER(), USER();" >/dev/null 2>&1; then
+          echo "❌ Auth failed. Common fixes:
+          - Ensure REMOTE_DB_HOST points to the real MySQL host
+          - Use full Hostinger username (with prefix) in DB_USERNAME
+          - Ensure grants for the host the server sees (often '127.0.0.1' on the remote)
+          " >&2
+          exit 1
+          fi
+          echo "✅ Auth OK"
       - name: Start SSH tunnel to Hostinger (MySQL)
         env:
           SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
