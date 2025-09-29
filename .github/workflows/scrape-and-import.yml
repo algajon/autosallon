@@ -75,22 +75,26 @@ jobs:
               -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'Auth OK'; exit"
 
       # IMPORTANT: forward to srv1802.hstgr.io:3306 so Hostinger sees source IP = 46.202.156.167
-      - name: Start SSH tunnel (runner:3307 → 46.202.156.167 → srv1802.hstgr.io:3306)
+      - name: Start SSH tunnel (runner:3307 → 46.202.156.167 → srv1802.hstgr.io:3306 over IPv4)
         env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}   # 46.202.156.167
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}   # your bastion, e.g. 46.202.156.167
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          REMOTE_DB_HOST: srv1802.hstgr.io
+          TUNNEL_PORT: 3307
+          # Use Hostinger's IPv4 directly to avoid AAAA/IPv6:
+          REMOTE_DB_IPV4: 92.113.22.50
         run: |
           set -euo pipefail
-          ssh -f -N \
+          # -4 forces IPv4 for the SSH connection; using numeric IPv4 for the DB target
+          ssh -f -N -4 \
             -o ExitOnForwardFailure=yes \
             -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-            -L ${TUNNEL_PORT}:${REMOTE_DB_HOST}:3306 \
+            -L ${TUNNEL_PORT}:${REMOTE_DB_IPV4}:3306 \
             -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
+
           for i in {1..20}; do
             if ss -lnt | grep -q ":${TUNNEL_PORT}"; then
-              echo "Tunnel up on ${TUNNEL_PORT} -> ${REMOTE_DB_HOST}:3306 via ${SSH_HOST}"
+              echo "Tunnel up on ${TUNNEL_PORT} -> ${REMOTE_DB_IPV4}:3306 via ${SSH_HOST}"
               exit 0
             fi
             sleep 0.5
