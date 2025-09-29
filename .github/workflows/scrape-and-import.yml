@@ -115,8 +115,8 @@ jobs:
 
       - name: Clean stale Chrome (best-effort)
         run: |
-            pkill -f chrome || true
-            pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f chromedriver || true
             
       - name: Run scraper
         env:
