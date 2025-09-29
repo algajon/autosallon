@@ -29,6 +29,7 @@ from selenium.common.exceptions import (
     UnexpectedAlertPresentException,
     NoAlertPresentException,
 )
+import uuid
 import pymysql
 import pathlib
 import tempfile, shutil
