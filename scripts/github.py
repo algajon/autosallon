@@ -1679,11 +1679,16 @@ def get_paging_info(browser):
 def build_browser():
     """
     One unique Chrome profile per run.
-    No headless=False, no shared user-data-dir (unless provided via env).
+    Headless can be toggled with HEADLESS=false to go headful in CI.
     """
     opts = Options()
-    # Headless + CI-safe flags
-    opts.add_argument("--headless=new")
+
+    # Headless toggle (default: headless)
+    use_headless = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes")
+    if use_headless:
+        opts.add_argument("--headless=new")
+
+    # CI-safe flags
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
@@ -1691,20 +1696,26 @@ def build_browser():
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-gpu")
+
+    # Reduce automation fingerprints
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument("--disable-blink-features=AutomationControlled")
 
     # Respect setup-chrome path if provided
     chrome_bin = os.environ.get("CHROME_BIN")
     if chrome_bin:
         opts.binary_location = chrome_bin
 
-    # Auto-translate KR -> EN
+    # Auto-translate KR -> EN (best effort)
     opts.add_experimental_option("prefs", {
         "intl.accept_languages": "en-US,en",
         "translate_whitelists": {"ko": "en"},
         "translate": {"enabled": True},
     })
 
-    # Unique user-data-dir; prefer the one workflow created
+    # Unique profile; prefer the one workflow created
     external_profile = os.environ.get("CHROME_USER_DATA_DIR")
     if external_profile:
         profile_dir = external_profile
@@ -1712,14 +1723,25 @@ def build_browser():
     else:
         profile_dir = tempfile.mkdtemp(prefix=f"encar-chrome-{uuid.uuid4().hex[:8]}-")
         cleanup_profile = True
-    cache_dir   = tempfile.mkdtemp(prefix=f"encar-cache-{uuid.uuid4().hex[:8]}-")
-
+    cache_dir = tempfile.mkdtemp(prefix=f"encar-cache-{uuid.uuid4().hex[:8]}-")
     opts.add_argument(f"--user-data-dir={profile_dir}")
     opts.add_argument(f"--profile-directory=Profile-Default")
     opts.add_argument(f"--disk-cache-dir={cache_dir}")
 
-    # Let Selenium Manager find & provision the correct chromedriver
+    # Let Selenium Manager resolve the driver (after we removed /usr/bin/chromedriver)
     br = Browser("chrome", options=opts)
+
+    # Mild stealth: hide webdriver / set languages/platform
+    try:
+        br.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+                Object.defineProperty(navigator, 'platform',  { get: () => 'Linux x86_64' });
+            """
+        })
+    except Exception:
+        pass
 
     try:
         try:
@@ -1729,14 +1751,11 @@ def build_browser():
             pass
         yield br
     finally:
-        try:
-            br.quit()
-        except Exception:
-            pass
-        # Clean up only our temp dirs (not the external one from the workflow)
+        try: br.quit()
+        except Exception: pass
         if cleanup_profile:
             shutil.rmtree(profile_dir, ignore_errors=True)
-        shutil.rmtree(cache_dir,   ignore_errors=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 def main():
     with build_browser() as browser:
