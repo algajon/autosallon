@@ -448,14 +448,26 @@ def safe_current_url(browser) -> str:
     except Exception:
         return ""
 
-# ---------- Row helpers & force load ----------
-ROW_SEL = 'tr[data-index], li[data-index], [data-index][role="row"]'
-
-def _find_rows(browser):
-    try:
-        return browser.find_by_css(ROW_SEL)
-    except Exception:
-        return []
+# ---------- List row helpers (Encar DOM) ----------
+def find_list_rows(browser):
+    """
+    Encar renders rows under <tbody id="sr_normal"> as tr[data-index].
+    Fall back to generic selectors for safety.
+    """
+    sels = [
+        'tbody#sr_normal tr[data-index]',
+        'table#sr_normal tr[data-index]',
+        'tr[data-index]',
+        'li[data-index]'
+    ]
+    for sel in sels:
+        try:
+            rows = browser.find_by_css(sel)
+            if rows and len(rows) > 0:
+                return rows
+        except Exception:
+            pass
+    return []
 
 def dismiss_overlays(browser):
     try:
@@ -480,11 +492,12 @@ def wait_for_list(browser, timeout=15) -> bool:
     t0 = time.time()
     while time.time() - t0 < timeout:
         dismiss_overlays(browser)
-        rows = _find_rows(browser)
+        rows = find_list_rows(browser)
         if rows:
             return True
         try:
             browser.execute_script("window.scrollBy(0, 600);")
+            browser.execute_script("window.dispatchEvent(new Event('scroll'));")
         except Exception:
             pass
         time.sleep(0.4)
@@ -496,7 +509,7 @@ def force_load_list_rows(browser, want=PER_PAGE, max_scrolls=24, pause=0.35) -> 
     """
     def row_count() -> int:
         try:
-            return len(_find_rows(browser))
+            return len(find_list_rows(browser))
         except Exception:
             return 0
 
@@ -522,6 +535,8 @@ def force_load_list_rows(browser, want=PER_PAGE, max_scrolls=24, pause=0.35) -> 
             except: pass
             time.sleep(pause)
         try: browser.execute_script("window.scrollTo(0, 0);")
+        except: pass
+        try: browser.execute_script("window.dispatchEvent(new Event('scroll'));")
         except: pass
         time.sleep(pause * 0.8)
 
@@ -1246,31 +1261,44 @@ def get_list_records_from_state(state):
     return results
 
 def list_row_dom_extract(row):
+    """
+    Extract title, price and href from a list row using the actual Encar markup.
+    """
     title = ""; priceText = ""; href = ""; html = ""
     try:
-        html = row.html
+        html = row.html or ""
     except:
         html = ""
+
+    # Title + link (prefer the official detail link)
     try:
-        info = row.find_by_css("td.inf")
-        if info:
-            a = info.first.find_by_tag("a")
-            if a:
-                title = a.first.text.strip()
-                try: href = a.first["href"]
-                except: href = ""
-            else:
-                title = info.first.text.strip()
-    except: pass
-    try:
-        for sel in ['td.prc','td.prc *','[class*=price]','strong','em','span']:
+        link = None
+        for sel in ['td.inf a.newLink._link', 'td.img a.newLink._link', 'a[href*="dc_cardetailview"]']:
             els = row.find_by_css(sel)
             if els:
-                txt = els.first.text.strip()
-                if re.search(r'\d', txt):
-                    priceText = txt
+                link = els.first
+                break
+        if link:
+            title = (link.text or "").strip()
+            try:
+                href = link["href"]
+            except:
+                href = ""
+    except:
+        pass
+
+    # Price cell (e.g., <td class="prc_hs"><strong class="prc">... 원</strong>)
+    try:
+        for sel in ['td.prc_hs .prc', 'td.prc .prc', '[class*="prc"]', '[class*="price"]']:
+            els = row.find_by_css(sel)
+            if els:
+                t = (els.first.text or "").strip()
+                if any(ch.isdigit() for ch in t):
+                    priceText = t
                     break
-    except: pass
+    except:
+        pass
+
     return {"title": title, "priceText": priceText, "href": href, "priceNum": None, "row_html": html}
 
 PRICE_CELL_RE = re.compile(
@@ -1567,28 +1595,36 @@ def absolutize(href):
     return href if href.startswith("http") else "https://www.encar.com"+(href if href.startswith("/") else "/"+href)
 
 def click_detail_and_get_url(browser, row, retries=3):
-    sels=['a[data-enlog-dt-eventname="차량상세"]','a._link[target="_blank"]','td.inf a[href*="dc_cardetailview"]','a[href*="dc_cardetailview"]']
+    sels = [
+        'td.inf a.newLink._link',
+        'td.img a.newLink._link',
+        'a[data-enlog-dt-eventname="차량상세"]',
+        'a[href*="dc_cardetailview"]'
+    ]
     href=""
     for sel in sels:
         links=row.find_by_css(sel)
         if not links: continue
+        el = links.first
+        try: href = el["href"]
+        except: href=""
         for _ in range(retries):
-            el=row.find_by_css(sel).first
-            try: href = el["href"]
-            except: href=""
             try:
                 browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el._element); time.sleep(0.12)
                 (el.click() if el.visible else browser.execute_script("arguments[0].click();", el._element))
                 return absolutize(href)
             except (ElementNotInteractableException, ElementClickInterceptedException, StaleElementReferenceException):
                 time.sleep(0.25)
-            except: time.sleep(0.25)
+            except:
+                time.sleep(0.25)
+    # last-resort generic anchor
     try:
         el=row.find_by_tag("a").first; href=el["href"]
         browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el._element); time.sleep(0.12)
         (el.click() if el.visible else browser.execute_script("arguments[0].click();", el._element))
         return absolutize(href)
-    except: return ""
+    except:
+        return ""
 
 def switch_to_new_tab(browser, prev_count, timeout=8):
     t0=time.time()
@@ -1629,7 +1665,7 @@ def go_to_page(browser, page_no, timeout=10):
         t0 = time.time()
         while time.time()-t0 < timeout:
             try:
-                if len(_find_rows(browser)) > 0:
+                if len(find_list_rows(browser)) > 0:
                     return True
             except:
                 pass
@@ -1820,18 +1856,18 @@ def main():
                 list_state = get_full_state(browser) if wait_for_state(browser, 3) else {}
                 state_records = get_list_records_from_state(list_state)
 
-                # Always use the unified selector
-                rows = _find_rows(browser)
+                # Always use the robust Encar selector set
+                rows = find_list_rows(browser)
                 rows_count = len(rows)
                 if rows_count < PER_PAGE:
                     extra = force_load_list_rows(browser, want=PER_PAGE)
-                    rows = _find_rows(browser)
+                    rows = find_list_rows(browser)
                     rows_count = len(rows)
                     print(f"[list] visible rows now: {rows_count} (force_load returned {extra})")
 
                 row_index = 0
                 while row_index < rows_count and total_done < MAX_LISTINGS:
-                    rows = _find_rows(browser)
+                    rows = find_list_rows(browser)
                     if not rows or row_index >= len(rows):
                         break
 
@@ -1852,6 +1888,7 @@ def main():
                     priceText = (rec.get("priceText") or "").strip()
                     priceNum  = rec.get("priceNum", None)
                     row_html  = rec.get("row_html") or ""
+                    href_raw  = rec.get("href") or ""
 
                     brand, model, variant = parse_title_brand_model_variant(title)
                     krw_list, eur_list = parse_list_price_eur(priceText, priceNum, row_html)
@@ -1862,6 +1899,13 @@ def main():
                     seats_hint     = inline_vals.get("seats") or 0
 
                     inline_report_url = get_inline_report_url(browser, row_index)
+
+                    # Fallback: build report URL from list href (?carid=XXXX)
+                    if not inline_report_url and href_raw:
+                        m = re.search(r'[?&]carid=(\d+)', href_raw)
+                        if m:
+                            inline_report_url = _build_report_url_from_carid(m.group(1))
+
                     listing_thumb = extract_listing_thumb(row)
 
                     prev_tabs = len(browser.windows)
