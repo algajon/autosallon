@@ -26,16 +26,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system deps (MariaDB client, SSH)
+      - name: Install system deps (SSH + Python CSV helper)
         run: |
           sudo apt-get update
-          sudo apt-get install -y mariadb-client openssh-client
+          sudo apt-get install -y openssh-client
 
       - name: Prepare SSH key (key-only; no password)
         env:
           SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
         run: |
-          set -euo pipefail
+          set -e
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
@@ -59,20 +59,13 @@ jobs:
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
         run: |
-          set -e
-          ssh -vvv -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-            -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'SSH OK'; exit"
+          ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo SSH OK"
 
       # ---------- SCRAPER ----------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Prepare unique Chrome profile dir
-        run: |
-          echo "CHROME_USER_DATA_DIR=$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> $GITHUB_ENV
-          mkdir -p "$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
       - name: Clean stale Chrome (best-effort)
         run: |
@@ -87,70 +80,46 @@ jobs:
         env:
           KRW_EUR: ${{ env.KRW_EUR }}
         run: |
-          set -euo pipefail
+          set -e
           mkdir -p "$CSV_DIR"
           python scripts/github.py
-          test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
+          test -s "${CSV_DIR}/${CSV_NAME}" || { echo "CSV not found at ${CSV_DIR}/${CSV_NAME}"; exit 1; }
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
-      # ---------- COPY CSV & IMPORT FROM SSH HOST ----------
-      - name: Upload CSV to SSH host
-        env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          CSV_DIR: ${{ env.CSV_DIR }}
-          CSV_NAME: ${{ env.CSV_NAME }}
+      # ---------- PUSH CSV + IMPORT (no LOAD DATA; batched UPSERTs) ----------
+      - name: Create importer script locally
         run: |
-          set -euo pipefail
-          LOCAL_CSV="$GITHUB_WORKSPACE/${CSV_DIR}/${CSV_NAME}"
-          echo "Looking for CSV at: $LOCAL_CSV"
-          ls -l "$GITHUB_WORKSPACE/${CSV_DIR}" || true
-          test -s "$LOCAL_CSV" || { echo "CSV not found at $LOCAL_CSV"; exit 1; }
+          cat > importer.py <<'PY'
+          #!/usr/bin/env python3
+          import os, sys, csv, math
+          import pymysql
 
-          REMOTE_CSV="/tmp/encar_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}.csv"
-          scp -P "$SSH_PORT" -i ~/.ssh/id_ed25519 "$LOCAL_CSV" \
-              "${SSH_USER}@${SSH_HOST}:${REMOTE_CSV}"
-          echo "REMOTE_CSV=$REMOTE_CSV" >> "$GITHUB_ENV"
+          host     = os.environ['DB_HOST']
+          user     = os.environ['DB_USER']
+          password = os.environ['DB_PASS']
+          database = os.environ['DB_NAME']
+          csv_path = os.environ['CSV_PATH']
 
-      - name: Import CSV on SSH host → Hostinger MySQL (no SET SESSION)
-        env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          DB_NAME:  ${{ secrets.DB_DATABASE }}
-          DB_USER:  ${{ secrets.DB_USERNAME }}
-          DB_PASS:  ${{ secrets.DB_PASSWORD }}
-          REMOTE_CSV: ${{ env.REMOTE_CSV }}
-        run: |
-          set -euo pipefail
-          # Pass variables explicitly into the remote shell
-          ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" \
-            "$SSH_USER@$SSH_HOST" \
-            "DB_HOST='srv1802.hstgr.io' \
-             DB_NAME='${DB_NAME}' \
-             DB_USER='${DB_USER}' \
-             DB_PASS='${DB_PASS}' \
-             CSV_PATH='${REMOTE_CSV}' \
-             bash -s" <<'REMOTE'
-          set -euo pipefail
+          def to_int(x):
+            if x is None: return None
+            s = str(x).strip()
+            if s == "" or s.lower() in {"null","none","nan"}: return None
+            try: return int(float(s.replace(",","")))
+            except: return None
 
-          # Ensure mariadb client is present (best-effort)
-          command -v mariadb >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y mariadb-client || true; }
+          conn = pymysql.connect(
+              host=host, user=user, password=password, database=database, port=3306,
+              charset="utf8mb4",
+              ssl={"ca": "/etc/ssl/certs/ca-certificates.crt"},
+              connect_timeout=15,
+          )
+          cur = conn.cursor()
+          cur.execute("SELECT @@version, CURRENT_USER(), USER()")
+          print("server,cur_user,login_user:", cur.fetchone(), flush=True)
 
-          echo "Server + identity:"
-          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
-            -h "$DB_HOST" -u "$DB_USER" -e "SELECT @@version AS version, CURRENT_USER() AS cur_user, USER() AS login_user;" "$DB_NAME"
-
-          echo "local_infile setting (server):"
-          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
-            -h "$DB_HOST" -u "$DB_USER" -e "SHOW VARIABLES LIKE 'local_infile';" "$DB_NAME"
-
-          # Create staging
-          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
-            -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" <<'SQL'
-          DROP TABLE IF EXISTS stg_encar;
-          CREATE TABLE stg_encar (
+          # Ensure table + unique index
+          cur.execute("""
+          CREATE TABLE IF NOT EXISTS vehicles (
             prodhuesi        VARCHAR(80),
             modeli           VARCHAR(120),
             varianti         VARCHAR(160),
@@ -167,48 +136,22 @@ jobs:
             listing_url      VARCHAR(512),
             opsionet         MEDIUMTEXT,
             raporti_url      TEXT
-          ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-          SQL
+          ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+          """)
+          cur.execute("""
+          SELECT COUNT(1) FROM information_schema.statistics
+          WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url'
+          """)
+          if cur.fetchone()[0] == 0:
+            cur.execute("ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255))")
 
-          # Load CSV → staging
-          # NOTE: do NOT SET SESSION local_infile — just enable client-side and rely on server setting.
-          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl --local-infile=1 \
-            -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" --execute="
-            LOAD DATA LOCAL INFILE '${CSV_PATH}'
-            INTO TABLE stg_encar
-            CHARACTER SET utf8mb4
-            FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
-            LINES TERMINATED BY '\n'
-            IGNORE 1 LINES
-            (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
-          "
-
-          # Ensure final table + unique index (idempotent)
-          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
-            -h "$DB_HOST" -u "$DB_USER" -e "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "$DB_NAME"
-
-          HAS_IDX="$(MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
-            -h "$DB_HOST" -u "$DB_USER" -N -B -e \
-            "SELECT COUNT(1) FROM information_schema.statistics
-             WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url';" "$DB_NAME")"
-          if [ "$HAS_IDX" -eq 0 ]; then
-            MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
-              -h "$DB_HOST" -u "$DB_USER" -e \
-              "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "$DB_NAME"
-          fi
-
-          # Upsert
-          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
-            -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" <<'SQL'
-          INSERT INTO vehicles (
-            prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-            transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
-          )
-          SELECT
-            prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-            transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
-          FROM stg_encar
+          # Prepare UPSERT
+          cols = ("prodhuesi","modeli","varianti","viti","cmimi_eur","kilometrazhi_km","karburanti","ngjyra",
+                  "transmisioni","uleset","vin","engine_cc","images","listing_url","opsionet","raporti_url")
+          placeholders = ",".join(["%s"]*len(cols))
+          insert_sql = f"""
+          INSERT INTO vehicles ({",".join(cols)})
+          VALUES ({placeholders})
           ON DUPLICATE KEY UPDATE
             prodhuesi=VALUES(prodhuesi),
             modeli=VALUES(modeli),
@@ -224,8 +167,109 @@ jobs:
             engine_cc=VALUES(engine_cc),
             images=VALUES(images),
             opsionet=VALUES(opsionet),
-            raporti_url=VALUES(raporti_url);
-          SQL
+            raporti_url=VALUES(raporti_url)
+          """
 
-          rm -f -- "$CSV_PATH"
+          total = 0
+          batch = []
+          BATCH_SIZE = 500
+
+          with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+              row = (
+                r.get("prodhuesi"),
+                r.get("modeli"),
+                r.get("varianti"),
+                r.get("viti"),
+                to_int(r.get("cmimi_eur")),
+                to_int(r.get("kilometrazhi_km")),
+                r.get("karburanti"),
+                r.get("ngjyra"),
+                r.get("transmisioni"),
+                r.get("uleset"),
+                r.get("vin"),
+                to_int(r.get("engine_cc")),
+                r.get("images"),
+                r.get("listing_url"),
+                r.get("opsionet"),
+                r.get("raporti_url"),
+              )
+              batch.append(row)
+              if len(batch) >= BATCH_SIZE:
+                cur.executemany(insert_sql, batch)
+                conn.commit()
+                total += len(batch); batch.clear()
+
+          if batch:
+            cur.executemany(insert_sql, batch)
+            conn.commit()
+            total += len(batch)
+
+          print(f"upserted_rows={total}", flush=True)
+          cur.close(); conn.close()
+          PY
+
+      - name: Push CSV + importer to SSH host
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          CSV_DIR: ${{ env.CSV_DIR }}
+          CSV_NAME: ${{ env.CSV_NAME }}
+        run: |
+          set -e
+          LOCAL_CSV="$GITHUB_WORKSPACE/${CSV_DIR}/${CSV_NAME}"
+          test -s "$LOCAL_CSV" || { echo "CSV not found at $LOCAL_CSV"; exit 1; }
+
+          REMOTE_DIR="/tmp/encar_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          REMOTE_CSV="${REMOTE_DIR}/cars.csv"
+          REMOTE_SCRIPT="${REMOTE_DIR}/importer.py"
+
+          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$REMOTE_DIR'"
+          scp -P "$SSH_PORT" -i ~/.ssh/id_ed25519 "$LOCAL_CSV" "$SSH_USER@$SSH_HOST:$REMOTE_CSV"
+          scp -P "$SSH_PORT" -i ~/.ssh/id_ed25519 importer.py "$SSH_USER@$SSH_HOST:$REMOTE_SCRIPT"
+
+          echo "REMOTE_DIR=$REMOTE_DIR"   >> $GITHUB_ENV
+          echo "REMOTE_CSV=$REMOTE_CSV"   >> $GITHUB_ENV
+          echo "REMOTE_SCRIPT=$REMOTE_SCRIPT" >> $GITHUB_ENV
+
+      - name: Import on SSH host (Python; no LOAD DATA)
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          DB_NAME:  ${{ secrets.DB_DATABASE }}
+          DB_USER:  ${{ secrets.DB_USERNAME }}
+          DB_PASS:  ${{ secrets.DB_PASSWORD }}
+          REMOTE_CSV: ${{ env.REMOTE_CSV }}
+          REMOTE_SCRIPT: ${{ env.REMOTE_SCRIPT }}
+        run: |
+          set -e
+          # Install Python + driver on the SSH host, then run importer
+          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -s <<'REMOTE'
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip ca-certificates
+          pip3 install --user pymysql >/dev/null
+          python3 -V
           REMOTE
+
+          # Run importer with env (password stays masked in logs)
+          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            DB_HOST="srv1802.hstgr.io" \
+            DB_NAME="$DB_NAME" \
+            DB_USER="$DB_USER" \
+            DB_PASS="$DB_PASS" \
+            CSV_PATH="$REMOTE_CSV" \
+            "python3 '$REMOTE_SCRIPT'"
+
+      - name: Cleanup remote temp files (best-effort)
+        if: always()
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          REMOTE_DIR: ${{ env.REMOTE_DIR }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "rm -rf '$REMOTE_DIR' || true"
