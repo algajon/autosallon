@@ -101,6 +101,8 @@ jobs:
       - name: Setup Chrome (optional)
         id: chrome
         uses: browser-actions/setup-chrome@v1
+        with: 
+          chrome-version: stable
 
       - name: Expose CHROME_BIN env (optional)
         run: echo "CHROME_BIN=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
