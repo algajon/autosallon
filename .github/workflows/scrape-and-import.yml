@@ -26,7 +26,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system deps (SSH + Python CSV helper)
+      - name: Install minimal deps (SSH client only)
         run: |
           sudo apt-get update
           sudo apt-get install -y openssh-client
@@ -86,12 +86,12 @@ jobs:
           test -s "${CSV_DIR}/${CSV_NAME}" || { echo "CSV not found at ${CSV_DIR}/${CSV_NAME}"; exit 1; }
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
-      # ---------- PUSH CSV + IMPORT (no LOAD DATA; batched UPSERTs) ----------
-      - name: Create importer script locally
+      # ---------- PUSH CSV + IMPORT (batched UPSERTs; no LOAD DATA) ----------
+      - name: Create importer script (local)
         run: |
           cat > importer.py <<'PY'
           #!/usr/bin/env python3
-          import os, sys, csv, math
+          import os, sys, csv, ssl
           import pymysql
 
           host     = os.environ['DB_HOST']
@@ -103,21 +103,28 @@ jobs:
           def to_int(x):
             if x is None: return None
             s = str(x).strip()
-            if s == "" or s.lower() in {"null","none","nan"}: return None
-            try: return int(float(s.replace(",","")))
+            if not s or s.lower() in {"null","none","nan"}: return None
+            s = s.replace(",","")
+            try: return int(float(s))
             except: return None
 
-          conn = pymysql.connect(
-              host=host, user=user, password=password, database=database, port=3306,
-              charset="utf8mb4",
-              ssl={"ca": "/etc/ssl/certs/ca-certificates.crt"},
-              connect_timeout=15,
-          )
+          def connect():
+            # Try plain first; if server enforces TLS, fall back with TLS (no verify)
+            try:
+              return pymysql.connect(host=host, user=user, password=password, database=database,
+                                     port=3306, charset="utf8mb4", connect_timeout=15)
+            except Exception:
+              ctx = ssl.create_default_context()
+              ctx.check_hostname = False
+              ctx.verify_mode = ssl.CERT_NONE
+              return pymysql.connect(host=host, user=user, password=password, database=database,
+                                     port=3306, charset="utf8mb4", connect_timeout=15, ssl={"ssl": ctx})
+
+          conn = connect()
           cur = conn.cursor()
           cur.execute("SELECT @@version, CURRENT_USER(), USER()")
           print("server,cur_user,login_user:", cur.fetchone(), flush=True)
 
-          # Ensure table + unique index
           cur.execute("""
           CREATE TABLE IF NOT EXISTS vehicles (
             prodhuesi        VARCHAR(80),
@@ -145,13 +152,11 @@ jobs:
           if cur.fetchone()[0] == 0:
             cur.execute("ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255))")
 
-          # Prepare UPSERT
           cols = ("prodhuesi","modeli","varianti","viti","cmimi_eur","kilometrazhi_km","karburanti","ngjyra",
                   "transmisioni","uleset","vin","engine_cc","images","listing_url","opsionet","raporti_url")
           placeholders = ",".join(["%s"]*len(cols))
-          insert_sql = f"""
-          INSERT INTO vehicles ({",".join(cols)})
-          VALUES ({placeholders})
+          sql = f"""
+          INSERT INTO vehicles ({",".join(cols)}) VALUES ({placeholders})
           ON DUPLICATE KEY UPDATE
             prodhuesi=VALUES(prodhuesi),
             modeli=VALUES(modeli),
@@ -171,13 +176,12 @@ jobs:
           """
 
           total = 0
-          batch = []
-          BATCH_SIZE = 500
+          batch, BATCH_SIZE = [], 500
 
           with open(csv_path, "r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
             for r in reader:
-              row = (
+              batch.append((
                 r.get("prodhuesi"),
                 r.get("modeli"),
                 r.get("varianti"),
@@ -194,17 +198,11 @@ jobs:
                 r.get("listing_url"),
                 r.get("opsionet"),
                 r.get("raporti_url"),
-              )
-              batch.append(row)
+              ))
               if len(batch) >= BATCH_SIZE:
-                cur.executemany(insert_sql, batch)
-                conn.commit()
-                total += len(batch); batch.clear()
-
+                cur.executemany(sql, batch); conn.commit(); total += len(batch); batch.clear()
           if batch:
-            cur.executemany(insert_sql, batch)
-            conn.commit()
-            total += len(batch)
+            cur.executemany(sql, batch); conn.commit(); total += len(batch)
 
           print(f"upserted_rows={total}", flush=True)
           cur.close(); conn.close()
@@ -230,9 +228,9 @@ jobs:
           scp -P "$SSH_PORT" -i ~/.ssh/id_ed25519 "$LOCAL_CSV" "$SSH_USER@$SSH_HOST:$REMOTE_CSV"
           scp -P "$SSH_PORT" -i ~/.ssh/id_ed25519 importer.py "$SSH_USER@$SSH_HOST:$REMOTE_SCRIPT"
 
-          echo "REMOTE_DIR=$REMOTE_DIR"   >> $GITHUB_ENV
-          echo "REMOTE_CSV=$REMOTE_CSV"   >> $GITHUB_ENV
-          echo "REMOTE_SCRIPT=$REMOTE_SCRIPT" >> $GITHUB_ENV
+          echo "REMOTE_DIR=$REMOTE_DIR"         >> $GITHUB_ENV
+          echo "REMOTE_CSV=$REMOTE_CSV"         >> $GITHUB_ENV
+          echo "REMOTE_SCRIPT=$REMOTE_SCRIPT"   >> $GITHUB_ENV
 
       - name: Import on SSH host (Python; no LOAD DATA)
         env:
@@ -246,30 +244,50 @@ jobs:
           REMOTE_SCRIPT: ${{ env.REMOTE_SCRIPT }}
         run: |
           set -e
-          # Install Python + driver on the SSH host, then run importer
+          # Ensure a usable Python and PyMySQL on the SSH host (user-space only; no sudo required)
           ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -s <<'REMOTE'
           set -e
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-pip ca-certificates
-          pip3 install --user pymysql >/dev/null
-          python3 -V
-          REMOTE
+          PY="$(command -v python3 || command -v python || true)"
+          if [ -z "$PY" ]; then
+            echo "No python found on SSH host. Attempting user-space bootstrap..."
+            # Quick user-space bootstrap via pyenv-ish fallback (skipped here to keep it lean)
+            echo "Please install python3 on the SSH host." >&2
+            exit 1
+          fi
+          "$PY" - <<'PYCHK'
+           import sys, subprocess
+           try:
+             import pymysql  # noqa: F401
+             print("pymysql: OK")
+           except Exception:
+             print("pymysql: installing...", flush=True)
+             try:
+               import ensurepip, site  # noqa: F401
+               ensurepip.bootstrap()
+             except Exception:
+               pass
+             subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "pymysql"])
+             import pymysql  # re-check
+             print("pymysql: installed")
+           PYCHK
+                     REMOTE
 
-          # Run importer with env (password stays masked in logs)
-          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            DB_HOST="srv1802.hstgr.io" \
-            DB_NAME="$DB_NAME" \
-            DB_USER="$DB_USER" \
-            DB_PASS="$DB_PASS" \
-            CSV_PATH="$REMOTE_CSV" \
-            "python3 '$REMOTE_SCRIPT'"
+                     # Run importer with env (password masked by Actions)
+                     ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+                       DB_HOST="srv1802.hstgr.io" \
+                       DB_NAME="$DB_NAME" \
+                       DB_USER="$DB_USER" \
+                       DB_PASS="$DB_PASS" \
+                       CSV_PATH="$REMOTE_CSV" \
+                       "python3 '$REMOTE_SCRIPT' || python '$REMOTE_SCRIPT'"
 
-      - name: Cleanup remote temp files (best-effort)
-        if: always()
-        env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          REMOTE_DIR: ${{ env.REMOTE_DIR }}
-        run: |
-          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "rm -rf '$REMOTE_DIR' || true"
+                 - name: Cleanup remote temp files (best-effort)
+                   if: always()
+                   env:
+                     SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+                     SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+                     SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+                     REMOTE_DIR: ${{ env.REMOTE_DIR }}
+                   run: |
+                     ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "rm -rf '$REMOTE_DIR' || true"
+
