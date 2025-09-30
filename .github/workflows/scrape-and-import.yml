@@ -138,7 +138,7 @@ jobs:
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
       # === MySQL import (explicit -p so we 100% send a password) ===
-      - name: Import CSV into MySQL (UPSERT)
+      - name: Import CSV into MySQL (UPSERT, no LOCAL INFILE)
         env:
           DB_DATABASE: ${{ secrets.DB_DATABASE }}
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
@@ -158,11 +158,10 @@ jobs:
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" \
             -e "SELECT VERSION() AS version, CURRENT_USER() AS user;"
 
-          # Stage table schema (drop + recreate)
+          # Ensure target table and unique index (same schema as before)
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
-          DROP TABLE IF EXISTS stg_encar;
-          CREATE TABLE stg_encar (
+          CREATE TABLE IF NOT EXISTS vehicles (
             prodhuesi        VARCHAR(80),
             modeli           VARCHAR(120),
             varianti         VARCHAR(160),
@@ -178,51 +177,41 @@ jobs:
             images           TEXT,
             listing_url      VARCHAR(512),
             opsionet         MEDIUMTEXT,
-            raporti_url      TEXT
+            raporti_url      TEXT,
+            UNIQUE KEY uniq_listing_url (listing_url(255))
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
 
-          # Bulk load CSV into staging (requires server to allow LOCAL INFILE)
-          mysql --protocol=TCP --ssl-mode=REQUIRED --local-infile=1 \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" \
-            -e "LOAD DATA LOCAL INFILE '${CSV_PATH}'
-                INTO TABLE stg_encar
-                CHARACTER SET utf8mb4
-                FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
-                LINES TERMINATED BY '\n'
-                IGNORE 1 LINES
-                (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-                 transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);"
+          python - <<'PY'
+          import csv, os, sys
+          import pymysql
 
-          # Ensure target table + unique index on listing_url for upsert
-          mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
-            "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "$DB_DATABASE"
+          host = os.environ["TUNNEL_HOST"]
+          port = int(os.environ["TUNNEL_PORT"])
+          user = os.environ["DB_USERNAME"]
+          password = os.environ["DB_PASSWORD"]
+          db = os.environ["DB_DATABASE"]
+          csv_path = os.path.abspath(os.path.join(os.getcwd(), os.environ["CSV_DIR"], os.environ["CSV_NAME"]))
 
-          HAS_IDX="$(mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -N -B -e \
-            "SELECT COUNT(1) FROM information_schema.statistics
-             WHERE table_schema = DATABASE()
-               AND table_name='vehicles'
-               AND index_name='uniq_listing_url';" "$DB_DATABASE")"
+          def to_int(s):
+            s = (s or "").strip()
+            # Remove thousands separators or spaces if present
+            s = s.replace(",", "").replace(" ", "")
+            return int(s) if s and s.lower() not in ("null", "none") else None
 
-          if [ "$HAS_IDX" -eq 0 ]; then
-            mysql --protocol=TCP --ssl-mode=REQUIRED \
-              -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
-              "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "$DB_DATABASE"
-          fi
+          conn = pymysql.connect(
+              host=host, port=port, user=user, password=password, database=db,
+              charset="utf8mb4", autocommit=False, cursorclass=pymysql.cursors.Cursor
+          )
+          cur = conn.cursor()
 
-          # Upsert from staging
-          mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
+          sql = """
           INSERT INTO vehicles (
             prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
+          ) VALUES (
+            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
           )
-          SELECT
-            prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-            transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
-          FROM stg_encar
           ON DUPLICATE KEY UPDATE
             prodhuesi=VALUES(prodhuesi),
             modeli=VALUES(modeli),
@@ -238,5 +227,43 @@ jobs:
             engine_cc=VALUES(engine_cc),
             images=VALUES(images),
             opsionet=VALUES(opsionet),
-            raporti_url=VALUES(raporti_url);
-          SQL
+            raporti_url=VALUES(raporti_url)
+          """
+
+          batch, batch_size, total = [], 500, 0
+          with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+              vals = (
+                row.get("prodhuesi"),
+                row.get("modeli"),
+                row.get("varianti"),
+                row.get("viti"),
+                to_int(row.get("cmimi_eur")),
+                to_int(row.get("kilometrazhi_km")),
+                row.get("karburanti"),
+                row.get("ngjyra"),
+                row.get("transmisioni"),
+                row.get("uleset"),
+                row.get("vin"),
+                to_int(row.get("engine_cc")),
+                row.get("images"),
+                row.get("listing_url"),
+                row.get("opsionet"),
+                row.get("raporti_url"),
+              )
+              batch.append(vals)
+              if len(batch) >= batch_size:
+                cur.executemany(sql, batch)
+                conn.commit()
+                total += len(batch)
+                batch.clear()
+          if batch:
+            cur.executemany(sql, batch)
+            conn.commit()
+            total += len(batch)
+
+          cur.close()
+          conn.close()
+          print(f"Upserted {total} rows from {csv_path}")
+          PY
