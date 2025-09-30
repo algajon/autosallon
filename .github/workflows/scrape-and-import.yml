@@ -132,15 +132,18 @@ jobs:
           sudo rm -f /usr/bin/chromedriver || true
           command -v chromedriver || echo "chromedriver not found in PATH (good)"
 
-      - name: Run scraper
+      - name: Run scraper (headful via Xvfb)
         env:
           KRW_EUR: ${{ env.KRW_EUR }}
           CSV_DIR: ${{ env.CSV_DIR }}
           CSV_NAME: ${{ env.CSV_NAME }}
+          # force headful
+          HEADLESS: "0"
         run: |
           set -euo pipefail
           mkdir -p "$CSV_DIR"
-          python scripts/github.py
+          # A real X display so the site renders its virtualized list
+          xvfb-run -a -s "-screen 0 1920x1080x24" python scripts/github.py
           test -s "${CSV_DIR}/${CSV_NAME}" || { echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1; }
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
