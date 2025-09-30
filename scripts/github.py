@@ -18,8 +18,6 @@ and **forces the list to lazy-load all rows** so it won’t stop after ~5.
 
 from splinter import Browser
 from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-# NOTE: no webdriver_manager imports; Selenium Manager will handle the driver
 import time, os, json, csv, re
 from collections import deque
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -450,25 +448,60 @@ def safe_current_url(browser) -> str:
     except Exception:
         return ""
 
-# ---------- NEW: force list to load all rows ----------
-def force_load_list_rows(browser, want=PER_PAGE, max_scrolls=24, pause=0.35):
-    """
-    Encar list is lazy-loaded. Scroll until at least `want` rows exist
-    (or we run out of attempts). Also tries clicking any "more" button.
-    """
-def row_count():
-    try:
-        # try table rows, list items, or generic row roles
-        return len(browser.find_by_css('tr[data-index], li[data-index], [data-index][role="row"]'))
-    except:
-        return 0
+# ---------- Row helpers & force load ----------
+ROW_SEL = 'tr[data-index], li[data-index], [data-index][role="row"]'
 
-    # Try a 'More' button if present
-    for sel in [
-        'button[aria-label*="more"]',
-        'button[class*="more"]',
-        'a[class*="more"]',
-    ]:
+def _find_rows(browser):
+    try:
+        return browser.find_by_css(ROW_SEL)
+    except Exception:
+        return []
+
+def dismiss_overlays(browser):
+    try:
+        sels = [
+            'button[aria-label*="close" i]', 'button[title*="close" i]', 'button[class*="close" i]',
+            'button[class*="agree" i]', 'button[id*="agree" i]',
+            '.btn_close', '.btn-close', '.close', '#close', '#agree'
+        ]
+        for sel in sels:
+            if browser.is_element_present_by_css(sel, wait_time=0.2):
+                try:
+                    el = browser.find_by_css(sel).first
+                    if el and el.visible:
+                        browser.execute_script("arguments[0].click();", el._element)
+                        time.sleep(0.2)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def wait_for_list(browser, timeout=15) -> bool:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        dismiss_overlays(browser)
+        rows = _find_rows(browser)
+        if rows:
+            return True
+        try:
+            browser.execute_script("window.scrollBy(0, 600);")
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return False
+
+def force_load_list_rows(browser, want=PER_PAGE, max_scrolls=24, pause=0.35) -> int:
+    """
+    Scroll until at least `want` rows exist (or attempts exhausted). Click a 'more' control if found.
+    """
+    def row_count() -> int:
+        try:
+            return len(_find_rows(browser))
+        except Exception:
+            return 0
+
+    # Click a 'More' control if present
+    for sel in ['button[aria-label*="more"]','button[class*="more"]','a[class*="more"]']:
         try:
             if browser.is_element_present_by_css(sel, wait_time=0.5):
                 el = browser.find_by_css(sel).first
@@ -480,31 +513,27 @@ def row_count():
                     try: browser.execute_script("arguments[0].click();", el._element)
                     except: pass
                 time.sleep(pause)
-        except:
-            pass
+        except: pass
 
-    seen = -1
-    tries = 0
+    seen, tries = -1, 0
     while tries < max_scrolls and row_count() < want:
-        try: browser.execute_script("window.scrollBy(0, 1200);")
-        except: pass
-        time.sleep(pause)
-        try: browser.execute_script("window.scrollBy(0, 1200);")
-        except: pass
-        time.sleep(pause)
+        for _ in range(2):
+            try: browser.execute_script("window.scrollBy(0, 1200);")
+            except: pass
+            time.sleep(pause)
         try: browser.execute_script("window.scrollTo(0, 0);")
         except: pass
         time.sleep(pause * 0.8)
 
         cnt = row_count()
         if cnt != seen:
-            seen = cnt
-            tries = 0
+            seen, tries = cnt, 0
         else:
             tries += 1
 
     time.sleep(0.25)
-    return row_count()
+    cnt = row_count()
+    return int(cnt if isinstance(cnt, int) else 0)
 
 # ---------------- Images ----------------
 def deep_collect_carpicture_paths(obj):
@@ -873,7 +902,7 @@ def parse_inline_detail_values(panel):
 
     pairs = []
     pairs += re.findall(r'<dt[^>]*>(.*?)</dt>\s*<dd[^>]*>(.*?)</dd>', html, flags=re.I|re.S)
-    pairs += re.findall(r'<th[^>]*>(.*?)</th>\s*<td[^>]*>(.*?)</td>', html, flags=re.I|re/S)
+    pairs += re.findall(r'<th[^>]*>(.*?)</th>\s*<td[^>]*>(.*?)</td>', html, flags=re.I|re.S)
     pairs += re.findall(
         r'<(?:span|div)[^>]*class="[^"]*(?:tit|title)[^"]*"[^>]*>(.*?)</(?:span|div)>\s*'
         r'<(?:span|div)[^>]*class="[^"]*(?:val|desc|value)[^"]*"[^>]*>(.*?)</(?:span|div)>',
@@ -1600,7 +1629,7 @@ def go_to_page(browser, page_no, timeout=10):
         t0 = time.time()
         while time.time()-t0 < timeout:
             try:
-                if browser.is_element_present_by_css('tr[data-index="0"]', wait_time=0.5):
+                if len(_find_rows(browser)) > 0:
                     return True
             except:
                 pass
@@ -1681,7 +1710,7 @@ def get_paging_info(browser):
 def build_browser():
     """
     Headful by default (HEADLESS=0). In CI we wrap with xvfb-run.
-    We DO NOT use webdriver_manager; Selenium Manager resolves the driver.
+    Selenium Manager resolves the matching chromedriver automatically.
     """
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -1728,8 +1757,8 @@ def build_browser():
     opts.add_argument("--profile-directory=Default")
     opts.add_argument(f"--disk-cache-dir={cache_dir}")
 
-    # ⬇️ No executable path -> Selenium Manager picks the matching chromedriver
-    service = Service()  # do NOT pass a path
+    # Selenium Manager picks the matching chromedriver
+    service = Service()  # no path on purpose
 
     br = Browser("chrome", options=opts, service=service)
     try:
@@ -1750,7 +1779,10 @@ def main():
         wait_ready(browser, 10)
         ensure_english(browser, 5)
 
-        # Force full list on first page
+        # Make sure the first page actually has rows, then force-load
+        if not wait_for_list(browser, timeout=20):
+            force_load_list_rows(browser, want=PER_PAGE)
+
         cnt = force_load_list_rows(browser, want=PER_PAGE)
         print(f"[list] rows loaded: {cnt}")
 
@@ -1779,7 +1811,6 @@ def main():
                             break
                         if not go_to_page(browser, current_page):
                             break
-                    # ensure list loaded on new page
                     cnt = force_load_list_rows(browser, want=PER_PAGE)
                     print(f"[list] page {current_page} rows loaded: {cnt}")
 
@@ -1789,20 +1820,18 @@ def main():
                 list_state = get_full_state(browser) if wait_for_state(browser, 3) else {}
                 state_records = get_list_records_from_state(list_state)
 
-                # always use the actual number of visible rows
-                rows = browser.find_by_css('tr[data-index], li[data-index], [data-index][role="row"]')
+                # Always use the unified selector
+                rows = _find_rows(browser)
                 rows_count = len(rows)
                 if rows_count < PER_PAGE:
-                    # try once more to coax lazy load
                     extra = force_load_list_rows(browser, want=PER_PAGE)
-                    rows = browser.find_by_css("tr[data-index]")
+                    rows = _find_rows(browser)
                     rows_count = len(rows)
                     print(f"[list] visible rows now: {rows_count} (force_load returned {extra})")
 
                 row_index = 0
                 while row_index < rows_count and total_done < MAX_LISTINGS:
-                    # refresh rows reference in case DOM changed
-                    rows = browser.find_by_css("tr[data-index]")
+                    rows = _find_rows(browser)
                     if not rows or row_index >= len(rows):
                         break
 
@@ -1902,7 +1931,6 @@ def main():
                     }
                     row_out = fill_blanks_in_row(row_out)
 
-                    # Optional direct DB write (kept for local runs)
                     if WRITE_DB:
                         missing = [v for v in ("DB_HOST","DB_PORT","DB_USERNAME","DB_PASSWORD","DB_DATABASE") if not os.getenv(v)]
                         if missing:
@@ -1910,7 +1938,6 @@ def main():
                         else:
                             upsert_vehicle(row_out)
 
-                    # Always write CSV; your workflow imports it afterward
                     writer.writerow(row_out)
 
                     total_done += 1
