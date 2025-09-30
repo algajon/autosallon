@@ -63,6 +63,20 @@ jobs:
             PasswordAuthentication no
             StrictHostKeyChecking no
           CFG
+          
+      - name: Sanity check from SSH host → Hostinger MySQL
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}     # 46.202.156.167
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          DB_NAME:  ${{ secrets.DB_DATABASE }}           # exact prefixed name from hPanel
+          DB_USER:  ${{ secrets.DB_USERNAME }}           # exact prefixed user from hPanel
+          DB_PASS:  ${{ secrets.DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "MYSQL_PWD='${DB_PASS}' mysql --protocol=TCP --ssl-mode=REQUIRED -h srv1802.hstgr.io -u '${DB_USER}' \
+             -e \"SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;\" '${DB_NAME}'"
 
       - name: Try SSH auth once (verbose)
         env:
