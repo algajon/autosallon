@@ -162,10 +162,8 @@ jobs:
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
 
-          mysql --protocol=TCP --ssl-mode=REQUIRED \
+          mysql --protocol=TCP \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" --execute="
-            SET SESSION local_infile=1;
-            LOAD DATA LOCAL INFILE '${CSV_PATH}'
             INTO TABLE stg_encar
             CHARACTER SET utf8mb4
             FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
