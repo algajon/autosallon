@@ -71,7 +71,7 @@ jobs:
               -h srv1802.hstgr.io -u '${DB_USER}' -e 'SELECT VERSION(), CURRENT_USER(), USER();' '${DB_NAME}'
           "
 
-       - name: Upload CSV to SSH host
+      - name: Upload CSV to SSH host
         env:
           SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
@@ -166,4 +166,4 @@ jobs:
           SQL
 
           rm -f -- "${CSV_PATH}"
-      REMOTE
+          REMOTE
