@@ -55,93 +55,58 @@ jobs:
             StrictHostKeyChecking no
           CFG
 
-      - name: Sanity SSH auth
+      - name: Sanity check from SSH host → Hostinger MySQL
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          DB_NAME:  ${{ secrets.DB_DATABASE }}     # exact prefixed name from hPanel
+          DB_USER:  ${{ secrets.DB_USERNAME }}     # exact prefixed user from hPanel
+          DB_PASS:  ${{ secrets.DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Try the login **from the SSH server** (no tunnel involved)
+          ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
+            MYSQL_PWD='${DB_PASS}' mysql --protocol=TCP --ssl-mode=REQUIRED \
+              -h srv1802.hstgr.io -u '${DB_USER}' -e 'SELECT VERSION(), CURRENT_USER(), USER();' '${DB_NAME}'
+          "
+
+       - name: Upload CSV to SSH host
         env:
           SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
         run: |
-          set -e
-          ssh -vvv -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-            -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'SSH OK'; exit"
+          set -euo pipefail
+          REMOTE_CSV="/tmp/encar_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}.csv"
+          scp -P "$SSH_PORT" -i ~/.ssh/id_ed25519 "${{ env.CSV_DIR }}/${{ env.CSV_NAME }}" \
+              "${SSH_USER}@${SSH_HOST}:${REMOTE_CSV}"
+          echo "REMOTE_CSV=$REMOTE_CSV" >> "$GITHUB_ENV"
 
-      - name: Start SSH tunnel (runner:3307 → bastion → Hostinger MySQL over IPv4)
+      - name: Import CSV on SSH host → Hostinger MySQL
         env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}        # 46.202.156.167
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          REMOTE_DB_HOST: ${{ secrets.REMOTE_DB_HOST }}      # 92.113.22.50
+          DB_NAME:  ${{ secrets.DB_DATABASE }}
+          DB_USER:  ${{ secrets.DB_USERNAME }}
+          DB_PASS:  ${{ secrets.DB_PASSWORD }}
         run: |
           set -euo pipefail
-          # Force IPv4 end-to-end and forward to Hostinger DB IPv4
-          ssh -f -N -4 \
-            -o ExitOnForwardFailure=yes \
-            -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-            -L ${TUNNEL_PORT}:${REMOTE_DB_HOST}:3306 \
-            -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
-          for i in {1..20}; do
-            if ss -lnt | grep -q ":${TUNNEL_PORT}"; then
-              echo "Tunnel up: ${TUNNEL_HOST}:${TUNNEL_PORT} -> ${REMOTE_DB_HOST}:3306 via ${SSH_HOST}"
-              exit 0
-            fi
-            sleep 0.5
-          done
-          echo "Tunnel did not open" >&2
-          exit 1
-
-      # === Your scraper (writes CSV to $CSV_DIR/$CSV_NAME) ===
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Prepare unique Chrome profile dir
-        run: |
-          echo "CHROME_USER_DATA_DIR=$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> $GITHUB_ENV
-          mkdir -p "$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-      - name: Clean stale Chrome (best-effort)
-        run: |
-          pkill -f chrome || true
-          pkill -f chromedriver || true
-
-      - name: Install Python requirements
-        run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Run scraper
-        env:
-          KRW_EUR: ${{ env.KRW_EUR }}
-        run: |
+          ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -s <<'REMOTE'
           set -euo pipefail
-          mkdir -p "$CSV_DIR"
-          python scripts/github.py
-          test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
-          ls -lh "${CSV_DIR}/${CSV_NAME}"
+          DB_HOST="srv1802.hstgr.io"
+          CSV_PATH="${REMOTE_CSV}"
 
-      # === MySQL import (explicit -p so we 100% send a password) ===
-      - name: Import CSV into MySQL (UPSERT)
-        env:
-          DB_DATABASE: ${{ secrets.DB_DATABASE }}
-          DB_USERNAME: ${{ secrets.DB_USERNAME }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-        run: |
-          set -euo pipefail
-          [[ -n "${DB_DATABASE:-}" ]] || { echo "DB_DATABASE missing"; exit 1; }
-          [[ -n "${DB_USERNAME:-}" ]] || { echo "DB_USERNAME missing"; exit 1; }
-          [[ -n "${DB_PASSWORD:-}" ]] || { echo "DB_PASSWORD missing"; exit 1; }
+          # Ensure mysql client is present
+          command -v mysql >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y mysql-client; }
 
-          HOST="${TUNNEL_HOST}"
-          PORT="${TUNNEL_PORT}"
-          CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
+          echo "MySQL ping/version (from SSH host):"
+          MYSQL_PWD="$DB_PASS" mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$DB_HOST" -u "$DB_USER" -e "SELECT VERSION(), CURRENT_USER(), USER();" "$DB_NAME"
 
-          echo "MySQL ping/version:"
-          mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" \
-            -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;" "$DB_DATABASE"
-
-          mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
+          MYSQL_PWD="$DB_PASS" mysql --protocol=TCP --ssl-mode=REQUIRED --local-infile=1 \
+            -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" <<SQL
           DROP TABLE IF EXISTS stg_encar;
           CREATE TABLE stg_encar (
             prodhuesi        VARCHAR(80),
@@ -161,37 +126,19 @@ jobs:
             opsionet         MEDIUMTEXT,
             raporti_url      TEXT
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-          SQL
 
-          mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" --execute="
-            SET SESSION local_infile=1;
-            LOAD DATA LOCAL INFILE '${CSV_PATH}'
-            INTO TABLE stg_encar
-            CHARACTER SET utf8mb4
-            FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
-            LINES TERMINATED BY '\n'
-            IGNORE 1 LINES
-            (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
-          " "$DB_DATABASE"
+          LOAD DATA LOCAL INFILE '${CSV_PATH}'
+          INTO TABLE stg_encar
+          CHARACTER SET utf8mb4
+          FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
+          LINES TERMINATED BY '\n'
+          IGNORE 1 LINES
+          (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+           transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
 
-          mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
-            "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "$DB_DATABASE"
+          CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;
+          ALTER TABLE vehicles ADD UNIQUE KEY IF NOT EXISTS uniq_listing_url (listing_url(255));
 
-          HAS_IDX="$(mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -N -B -e \
-            "SELECT COUNT(1) FROM information_schema.statistics
-             WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url';" "$DB_DATABASE")"
-          if [ "$HAS_IDX" -eq 0 ]; then
-            mysql --protocol=TCP --ssl-mode=REQUIRED \
-              -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
-              "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "$DB_DATABASE"
-          fi
-
-          mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
           INSERT INTO vehicles (
             prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
@@ -217,3 +164,6 @@ jobs:
             opsionet=VALUES(opsionet),
             raporti_url=VALUES(raporti_url);
           SQL
+
+          rm -f -- "${CSV_PATH}"
+      REMOTE
