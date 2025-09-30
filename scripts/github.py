@@ -1741,7 +1741,7 @@ def build_browser():
         except Exception:
             pass
         yield br
-     finally:
+    finally:
          try:
              br.quit()
          except Exception:
