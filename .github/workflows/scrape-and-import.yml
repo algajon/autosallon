@@ -127,6 +127,11 @@ jobs:
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      - name: Remove preinstalled chromedriver (let Selenium Manager choose)
+        run: |
+          sudo rm -f /usr/bin/chromedriver || true
+          command -v chromedriver || echo "chromedriver not found in PATH (good)"
+
       - name: Run scraper
         env:
           KRW_EUR: ${{ env.KRW_EUR }}
