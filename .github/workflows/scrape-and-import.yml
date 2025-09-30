@@ -18,11 +18,15 @@ jobs:
     timeout-minutes: 45
 
     env:
+      # Local tunnel target
       TUNNEL_HOST: 127.0.0.1
       TUNNEL_PORT: 3307
-      CSV_DIR: ${{ secrets.CSV_DIR != '' && secrets.CSV_DIR || 'scripts' }}
+
+      # Scraper outputs
       CSV_NAME: cars.csv
-      KRW_EUR: ${{ secrets.KRW_EUR != '' && secrets.KRW_EUR || '0.000615' }}
+      # Prefer repo/environment VARs for non-secret values; fall back to literal defaults
+      CSV_DIR: ${{ vars.CSV_DIR != '' && vars.CSV_DIR || 'scripts' }}
+      KRW_EUR: ${{ vars.KRW_EUR != '' && vars.KRW_EUR || '0.000615' }}
 
     steps:
       - name: Checkout
@@ -39,12 +43,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           if ! ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null 2>&1; then
-            echo "HOSTINGER_SSH_KEY is invalid or passphrase-protected."
+            echo "HOSTINGER_SSH_KEY is invalid or passphrase-protected." >&2
             exit 1
           fi
+          # Safer than StrictHostKeyChecking=no; learns unknown hosts once
           cat > ~/.ssh/config <<'CFG'
           Host *
             ServerAliveInterval 30
@@ -52,8 +57,9 @@ jobs:
             IdentitiesOnly yes
             PreferredAuthentications publickey
             PasswordAuthentication no
-            StrictHostKeyChecking no
+            StrictHostKeyChecking accept-new
           CFG
+          chmod 600 ~/.ssh/config
 
       - name: Sanity SSH auth
         env:
@@ -61,24 +67,26 @@ jobs:
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
         run: |
-          set -e
-          ssh -vvv -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-            -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'SSH OK'; exit"
+          set -euo pipefail
+          ssh -o LogLevel=ERROR -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
+            -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo SSH_OK"
 
-      - name: Start SSH tunnel (runner:3307 → bastion → Hostinger MySQL over IPv4)
+      - name: Start SSH tunnel (runner:3307 → bastion → Hostinger MySQL)
         env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}        # 46.202.156.167
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          REMOTE_DB_HOST: ${{ secrets.REMOTE_DB_HOST }}      # 92.113.22.50
+          REMOTE_DB_HOST: ${{ secrets.REMOTE_DB_HOST }}
         run: |
           set -euo pipefail
-          # Force IPv4 end-to-end and forward to Hostinger DB IPv4
+          # Backgrounded local TCP forward: 127.0.0.1:3307 -> REMOTE_DB_HOST:3306 via SSH_HOST
           ssh -f -N -4 \
             -o ExitOnForwardFailure=yes \
             -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
             -L ${TUNNEL_PORT}:${REMOTE_DB_HOST}:3306 \
             -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
+
+          # Wait for the listener to come up
           for i in {1..20}; do
             if ss -lnt | grep -q ":${TUNNEL_PORT}"; then
               echo "Tunnel up: ${TUNNEL_HOST}:${TUNNEL_PORT} -> ${REMOTE_DB_HOST}:3306 via ${SSH_HOST}"
@@ -88,6 +96,14 @@ jobs:
           done
           echo "Tunnel did not open" >&2
           exit 1
+
+      # === Optional: Chrome/Chromedriver for Selenium-like scrapers ===
+      - name: Setup Chrome (optional)
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Expose CHROME_BIN env (optional)
+        run: echo "CHROME_BIN=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
 
       # === Your scraper (writes CSV to $CSV_DIR/$CSV_NAME) ===
       - name: Set up Python
@@ -112,11 +128,13 @@ jobs:
       - name: Run scraper
         env:
           KRW_EUR: ${{ env.KRW_EUR }}
+          CSV_DIR: ${{ env.CSV_DIR }}
+          CSV_NAME: ${{ env.CSV_NAME }}
         run: |
           set -euo pipefail
           mkdir -p "$CSV_DIR"
           python scripts/github.py
-          test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
+          test -s "${CSV_DIR}/${CSV_NAME}" || { echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1; }
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
       # === MySQL import (explicit -p so we 100% send a password) ===
@@ -138,7 +156,9 @@ jobs:
           echo "MySQL ping/version:"
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" \
+            -e "SELECT VERSION() AS version, CURRENT_USER() AS user;"
 
+          # Stage table schema (drop + recreate)
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
           DROP TABLE IF EXISTS stg_encar;
@@ -162,17 +182,19 @@ jobs:
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
 
-          mysql --protocol=TCP \
-            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" --execute="
-            INTO TABLE stg_encar
-            CHARACTER SET utf8mb4
-            FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
-            LINES TERMINATED BY '\n'
-            IGNORE 1 LINES
-            (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
-             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
-          " "$DB_DATABASE"
+          # Bulk load CSV into staging (requires server to allow LOCAL INFILE)
+          mysql --protocol=TCP --ssl-mode=REQUIRED --local-infile=1 \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" \
+            -e "LOAD DATA LOCAL INFILE '${CSV_PATH}'
+                INTO TABLE stg_encar
+                CHARACTER SET utf8mb4
+                FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
+                LINES TERMINATED BY '\n'
+                IGNORE 1 LINES
+                (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+                 transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);"
 
+          # Ensure target table + unique index on listing_url for upsert
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
             "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "$DB_DATABASE"
@@ -180,13 +202,17 @@ jobs:
           HAS_IDX="$(mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -N -B -e \
             "SELECT COUNT(1) FROM information_schema.statistics
-             WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url';" "$DB_DATABASE")"
+             WHERE table_schema = DATABASE()
+               AND table_name='vehicles'
+               AND index_name='uniq_listing_url';" "$DB_DATABASE")"
+
           if [ "$HAS_IDX" -eq 0 ]; then
             mysql --protocol=TCP --ssl-mode=REQUIRED \
               -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
               "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "$DB_DATABASE"
           fi
 
+          # Upsert from staging
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
           INSERT INTO vehicles (
