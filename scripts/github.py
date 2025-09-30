@@ -18,6 +18,7 @@ and **forces the list to lazy-load all rows** so it won’t stop after ~5.
 
 from splinter import Browser
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 import time, os, json, csv, re
 from webdriver_manager.chrome import ChromeDriverManager
 from collections import deque
@@ -53,8 +54,8 @@ def upsert_vehicle(row):
             cur.execute(UPSERT_SQL, row)
 # ---------------- CONFIG ----------------
 BASE_URL = "https://www.encar.com/fc/fc_carsearchlist.do?carType=for#!%7B%22action%22%3A%22(And.Year.range(201500..)._.Hidden.N._.CarType.N._.SellType.%EC%9D%BC%EB%B0%98.)%22%2C%22toggle%22%3A%7B%224%22%3A0%7D%2C%22layer%22%3A%22%22%2C%22sort%22%3A%22ModifiedDate%22%2C%22page%22%3A1%2C%22limit%22%3A20%2C%22searchKey%22%3A%22%22%2C%22loginCheck%22%3Afalse%7D"
-MAX_LISTINGS = 3
-PER_PAGE     = 20
+MAX_LISTINGS = int(os.getenv("MAX_LISTINGS", "3"))
+PER_PAGE     = int(os.getenv("PER_PAGE", "20"))
 APP_ROOT = pathlib.Path(__file__).resolve().parent
 CSV_DIR  = os.getenv("CSV_DIR", str(APP_ROOT / "out"))
 os.makedirs(CSV_DIR, exist_ok=True)
@@ -1698,6 +1699,21 @@ def build_browser():
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-features=NetworkServiceInProcess")
+    opts.add_argument("--remote-debugging-port=9222")
+    # Reduce “automation” fingerprints
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    # Respect setup-chrome path if provided
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if chrome_bin:
+        opts.binary_location = chrome_bin
+    # UA helps some sites in headless mode
+    opts.add_argument(
+        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
 
     # Auto-translate KR -> EN
     opts.add_experimental_option("prefs", {
@@ -1714,17 +1730,22 @@ def build_browser():
     opts.add_argument(f"--disk-cache-dir={cache_dir}")
 
     # DO NOT pass headless=False here – we already set headless via opts
-    br = Browser("chrome", options=opts)
-
+    driver_path = ChromeDriverManager().install()
+    service = Service(driver_path)
+    br = Browser("chrome", options=opts, service=service)
     try:
-        yield br
-    finally:
+        # Reasonable timeouts for CI
         try:
-            br.quit()
+            br.driver.set_page_load_timeout(45)
+            br.driver.set_script_timeout(30)
         except Exception:
             pass
-        shutil.rmtree(profile_dir, ignore_errors=True)
-        shutil.rmtree(cache_dir,   ignore_errors=True)
+         yield br
+     finally:
+         try:
+             br.quit()
+         except Exception:
+             pass
         
 def main():
     with build_browser() as browser:
