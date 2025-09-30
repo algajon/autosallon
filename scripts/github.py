@@ -18,6 +18,7 @@ and **forces the list to lazy-load all rows** so it won’t stop after ~5.
 
 from splinter import Browser
 from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 # NOTE: no webdriver_manager imports; Selenium Manager will handle the driver
 import time, os, json, csv, re
 from collections import deque
@@ -455,11 +456,12 @@ def force_load_list_rows(browser, want=PER_PAGE, max_scrolls=24, pause=0.35):
     Encar list is lazy-loaded. Scroll until at least `want` rows exist
     (or we run out of attempts). Also tries clicking any "more" button.
     """
-    def row_count():
-        try:
-            return len(browser.find_by_css('tr[data-index]'))
-        except:
-            return 0
+def row_count():
+    try:
+        # try table rows, list items, or generic row roles
+        return len(browser.find_by_css('tr[data-index], li[data-index], [data-index][role="row"]'))
+    except:
+        return 0
 
     # Try a 'More' button if present
     for sel in [
@@ -1678,17 +1680,20 @@ def get_paging_info(browser):
 @contextmanager
 def build_browser():
     """
-    One unique Chrome profile per run.
-    Headless can be toggled with HEADLESS=false to go headful in CI.
+    Headful by default (HEADLESS=0). In CI we wrap with xvfb-run.
+    We DO NOT use webdriver_manager; Selenium Manager resolves the driver.
     """
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+
     opts = Options()
 
-    # Headless toggle (default: headless)
-    use_headless = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes")
-    if use_headless:
+    # Headful (unless HEADLESS=1)
+    headless = os.getenv("HEADLESS", "").strip() in ("1", "true", "yes")
+    if headless:
         opts.add_argument("--headless=new")
 
-    # CI-safe flags
+    # CI-safe flags (OK in headful too)
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
@@ -1697,65 +1702,46 @@ def build_browser():
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-gpu")
-
-    # Reduce automation fingerprints
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument("--disable-blink-features=AutomationControlled")
 
-    # Respect setup-chrome path if provided
-    chrome_bin = os.environ.get("CHROME_BIN")
+    # Use setup-chrome’s path if present
+    chrome_bin = (os.environ.get("CHROME_BIN")
+                  or shutil.which("chromium")
+                  or shutil.which("chromium-browser")
+                  or shutil.which("google-chrome")
+                  or shutil.which("chrome"))
     if chrome_bin:
         opts.binary_location = chrome_bin
 
-    # Auto-translate KR -> EN (best effort)
+    # Auto-translate KR -> EN
     opts.add_experimental_option("prefs", {
         "intl.accept_languages": "en-US,en",
         "translate_whitelists": {"ko": "en"},
         "translate": {"enabled": True},
     })
 
-    # Unique profile; prefer the one workflow created
-    external_profile = os.environ.get("CHROME_USER_DATA_DIR")
-    if external_profile:
-        profile_dir = external_profile
-        cleanup_profile = False
-    else:
-        profile_dir = tempfile.mkdtemp(prefix=f"encar-chrome-{uuid.uuid4().hex[:8]}-")
-        cleanup_profile = True
-    cache_dir = tempfile.mkdtemp(prefix=f"encar-cache-{uuid.uuid4().hex[:8]}-")
+    # Unique profile/cache per run (or reuse provided one)
+    profile_dir = os.getenv("CHROME_USER_DATA_DIR") or tempfile.mkdtemp(prefix="encar-chrome-")
+    cache_dir   = tempfile.mkdtemp(prefix="encar-cache-")
     opts.add_argument(f"--user-data-dir={profile_dir}")
-    opts.add_argument(f"--profile-directory=Profile-Default")
+    opts.add_argument("--profile-directory=Default")
     opts.add_argument(f"--disk-cache-dir={cache_dir}")
 
-    # Let Selenium Manager resolve the driver (after we removed /usr/bin/chromedriver)
-    br = Browser("chrome", options=opts)
+    # ⬇️ No executable path -> Selenium Manager picks the matching chromedriver
+    service = Service()  # do NOT pass a path
 
-    # Mild stealth: hide webdriver / set languages/platform
-    try:
-        br.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
-                Object.defineProperty(navigator, 'platform',  { get: () => 'Linux x86_64' });
-            """
-        })
-    except Exception:
-        pass
-
+    br = Browser("chrome", options=opts, service=service)
     try:
         try:
-            br.driver.set_page_load_timeout(45)
-            br.driver.set_script_timeout(30)
+            br.driver.set_page_load_timeout(60)
+            br.driver.set_script_timeout(45)
         except Exception:
             pass
         yield br
     finally:
         try: br.quit()
         except Exception: pass
-        if cleanup_profile:
-            shutil.rmtree(profile_dir, ignore_errors=True)
-        shutil.rmtree(cache_dir, ignore_errors=True)
 
 def main():
     with build_browser() as browser:
@@ -1804,7 +1790,7 @@ def main():
                 state_records = get_list_records_from_state(list_state)
 
                 # always use the actual number of visible rows
-                rows = browser.find_by_css("tr[data-index]")
+                rows = browser.find_by_css('tr[data-index], li[data-index], [data-index][role="row"]')
                 rows_count = len(rows)
                 if rows_count < PER_PAGE:
                     # try once more to coax lazy load
