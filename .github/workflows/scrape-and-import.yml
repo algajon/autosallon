@@ -135,6 +135,8 @@ jobs:
           DB_DATABASE: ${{ secrets.DB_DATABASE }}
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          CSV_DIR: ${{ env.CSV_DIR }}
+          CSV_NAME: ${{ env.CSV_NAME }}
         run: |
           set -euo pipefail
           [[ -n "${DB_DATABASE:-}" ]] || { echo "DB_DATABASE missing"; exit 1; }
@@ -142,14 +144,17 @@ jobs:
           [[ -n "${DB_PASSWORD:-}" ]] || { echo "DB_PASSWORD missing"; exit 1; }
 
           CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
+          HOST=127.0.0.1
+          PORT=3307
 
-          # 1) Prove creds are used (expect 'using password: YES' if they reach server)
           echo "MySQL ping/version:"
-          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" \
-                -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;" "${DB_DATABASE}"
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" \
+            -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;" "$DB_DATABASE"
 
-          # 2) Staging table
-          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" "${DB_DATABASE}" <<'SQL'
+          # Staging table
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
           DROP TABLE IF EXISTS stg_encar;
           CREATE TABLE stg_encar (
             prodhuesi        VARCHAR(80),
@@ -171,8 +176,9 @@ jobs:
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
 
-          # 3) Load CSV → staging
-          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" --execute="
+          # Load CSV → staging
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" --execute="
             SET SESSION local_infile=1;
             LOAD DATA LOCAL INFILE '${CSV_PATH}'
             INTO TABLE stg_encar
@@ -182,22 +188,26 @@ jobs:
             IGNORE 1 LINES
             (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
              transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
-          " "${DB_DATABASE}"
+          " "$DB_DATABASE"
 
-          # 4) Ensure final table + unique index (idempotent)
-          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" -e \
-            "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "${DB_DATABASE}"
+          # Ensure final table + unique index (idempotent)
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
+            "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "$DB_DATABASE"
 
-          HAS_IDX="$(mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" -N -B -e \
+          HAS_IDX="$(mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -N -B -e \
             "SELECT COUNT(1) FROM information_schema.statistics
-             WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url';" "${DB_DATABASE}")"
+             WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url';" "$DB_DATABASE")"
           if [ "$HAS_IDX" -eq 0 ]; then
-            mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" -e \
-              "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "${DB_DATABASE}"
+            mysql --protocol=TCP --ssl-mode=REQUIRED \
+              -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
+              "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "$DB_DATABASE"
           fi
 
-          # 5) Upsert
-          mysql --protocol=TCP -h "${TUNNEL_HOST}" -P "${TUNNEL_PORT}" -u "${DB_USERNAME}" -p"${DB_PASSWORD}" "${DB_DATABASE}" <<'SQL'
+          # Upsert
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
           INSERT INTO vehicles (
             prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
