@@ -1740,7 +1740,7 @@ def build_browser():
             br.driver.set_script_timeout(30)
         except Exception:
             pass
-         yield br
+        yield br
      finally:
          try:
              br.quit()
