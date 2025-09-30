@@ -33,7 +33,7 @@ from selenium.common.exceptions import (
 import uuid
 import pymysql
 import pathlib
-import tempfile, shutil
+import tempfile, shutil, subprocess
 from contextlib import contextmanager
 def db_conn():
     return pymysql.connect(
@@ -1706,7 +1706,11 @@ def build_browser():
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     # Respect setup-chrome path if provided
-    chrome_bin = os.environ.get("CHROME_BIN")
+    chrome_bin = os.environ.get("CHROME_BIN") or \
+                 shutil.which("google-chrome") or \
+                 shutil.which("chrome") or \
+                 shutil.which("chromium") or \
+                 shutil.which("chromium-browser")
     if chrome_bin:
         opts.binary_location = chrome_bin
     # UA helps some sites in headless mode
@@ -1730,7 +1734,18 @@ def build_browser():
     opts.add_argument(f"--disk-cache-dir={cache_dir}")
 
     # DO NOT pass headless=False here – we already set headless via opts
-    driver_path = ChromeDriverManager().install()
+    def _chrome_major(path):
+        try:
+            out = subprocess.check_output([path, "--version"], text=True).strip()
+            # e.g. "Chromium 143.0.7445.0" → "143"
+            import re
+            m = re.search(r"(\d+)\.", out)
+            return m.group(1) if m else None
+        except Exception:
+            return None
+    major = _chrome_major(chrome_bin) if chrome_bin else None
+    from webdriver_manager.chrome import ChromeDriverManager
+    driver_path = ChromeDriverManager(version=major if major else None).install()
     service = Service(driver_path)
     br = Browser("chrome", options=opts, service=service)
     try:
