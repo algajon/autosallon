@@ -1750,7 +1750,8 @@ def build_browser():
     driver_path = ChromeDriverManager(
         chrome_type=ChromeType.CHROMIUM,
         driver_version=None   # let it auto-detect based on installed Chromium
-    ).install()    service = Service(driver_path)
+    ).install()    
+    service = Service(driver_path)
     br = Browser("chrome", options=opts, service=service)
     try:
         # Reasonable timeouts for CI
