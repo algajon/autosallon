@@ -55,7 +55,7 @@ jobs:
             StrictHostKeyChecking no
           CFG
 
-      - name: Sanity: SSH auth
+      - name: Sanity SSH auth
         env:
           SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
