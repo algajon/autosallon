@@ -53,7 +53,7 @@ jobs:
             StrictHostKeyChecking no
           CFG
 
-      - name: Sanity
+      - name: Sanity SSH auth
         env:
           SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
@@ -89,27 +89,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$CSV_DIR"
-          # === replace with your real entrypoint if different ===
           python scripts/github.py
-          # ======================================================
           test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
           ls -lh "${CSV_DIR}/${CSV_NAME}"
-
-      # ---------- DB CHECK FROM SSH HOST ----------
-      - name: Sanity check from SSH host → Hostinger MySQL
-        env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          DB_NAME:  ${{ secrets.DB_DATABASE }}   # exact prefixed name from hPanel
-          DB_USER:  ${{ secrets.DB_USERNAME }}   # exact prefixed user from hPanel
-          DB_PASS:  ${{ secrets.DB_PASSWORD }}
-        run: |
-          set -euo pipefail
-          ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "MYSQL_PWD='${DB_PASS}' mariadb --protocol=TCP --ssl \
-               -h srv1802.hstgr.io -u '${DB_USER}' \
-               -e \"SELECT @@version AS version, CURRENT_USER() AS cur_user, USER() AS login_user;\" '${DB_NAME}'"
 
       # ---------- COPY CSV & IMPORT FROM SSH HOST ----------
       - name: Upload CSV to SSH host
@@ -131,7 +113,7 @@ jobs:
               "${SSH_USER}@${SSH_HOST}:${REMOTE_CSV}"
           echo "REMOTE_CSV=$REMOTE_CSV" >> "$GITHUB_ENV"
 
-      - name: Import CSV on SSH host → Hostinger MySQL
+      - name: Import CSV on SSH host → Hostinger MySQL (no SET SESSION)
         env:
           SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
@@ -156,9 +138,13 @@ jobs:
           # Ensure mariadb client is present (best-effort)
           command -v mariadb >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y mariadb-client || true; }
 
-          echo "MySQL ping/version (from SSH host):"
+          echo "Server + identity:"
           MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
             -h "$DB_HOST" -u "$DB_USER" -e "SELECT @@version AS version, CURRENT_USER() AS cur_user, USER() AS login_user;" "$DB_NAME"
+
+          echo "local_infile setting (server):"
+          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
+            -h "$DB_HOST" -u "$DB_USER" -e "SHOW VARIABLES LIKE 'local_infile';" "$DB_NAME"
 
           # Create staging
           MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
@@ -185,9 +171,9 @@ jobs:
           SQL
 
           # Load CSV → staging
+          # NOTE: do NOT SET SESSION local_infile — just enable client-side and rely on server setting.
           MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl --local-infile=1 \
             -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" --execute="
-            SET SESSION local_infile=1;
             LOAD DATA LOCAL INFILE '${CSV_PATH}'
             INTO TABLE stg_encar
             CHARACTER SET utf8mb4
