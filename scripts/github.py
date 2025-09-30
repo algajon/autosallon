@@ -18,10 +18,8 @@ and **forces the list to lazy-load all rows** so it won’t stop after ~5.
 
 from splinter import Browser
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.core.utils import ChromeType
+# NOTE: no webdriver_manager imports; Selenium Manager will handle the driver
 import time, os, json, csv, re
-from webdriver_manager.chrome import ChromeDriverManager
 from collections import deque
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from selenium.common.exceptions import (
@@ -34,8 +32,9 @@ from selenium.common.exceptions import (
 import uuid
 import pymysql
 import pathlib
-import tempfile, shutil, subprocess
+import tempfile, shutil
 from contextlib import contextmanager
+
 def db_conn():
     return pymysql.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
@@ -48,11 +47,11 @@ def db_conn():
         autocommit=True,
     )
 
-
 def upsert_vehicle(row):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(UPSERT_SQL, row)
+
 # ---------------- CONFIG ----------------
 BASE_URL = "https://www.encar.com/fc/fc_carsearchlist.do?carType=for#!%7B%22action%22%3A%22(And.Year.range(201500..)._.Hidden.N._.CarType.N._.SellType.%EC%9D%BC%EB%B0%98.)%22%2C%22toggle%22%3A%7B%224%22%3A0%7D%2C%22layer%22%3A%22%22%2C%22sort%22%3A%22ModifiedDate%22%2C%22page%22%3A1%2C%22limit%22%3A20%2C%22searchKey%22%3A%22%22%2C%22loginCheck%22%3Afalse%7D"
 MAX_LISTINGS = int(os.getenv("MAX_LISTINGS", "3"))
@@ -81,18 +80,17 @@ ON DUPLICATE KEY UPDATE
   opsionet=VALUES(opsionet),
   raporti_url=VALUES(raporti_url);
 """
+
 # Exchange rate (KRW -> EUR). Override with:  KRW_EUR=0.00061 python ...
 def getenv_float(name, default):
     v = os.getenv(name, "")
     try:
         s = (v or "").strip()
-        # keep only digits, dot/comma, exp markers, sign
         s = re.sub(r"[^0-9,.\-+eE]", "", s)
         s = s.replace(",", ".")
         return float(s) if s else float(default)
     except Exception:
         return float(default)
-
 
 KRW_EUR = getenv_float("KRW_EUR", 0.000615)
 FINISH_WORDS_RE = re.compile(
@@ -873,7 +871,7 @@ def parse_inline_detail_values(panel):
 
     pairs = []
     pairs += re.findall(r'<dt[^>]*>(.*?)</dt>\s*<dd[^>]*>(.*?)</dd>', html, flags=re.I|re.S)
-    pairs += re.findall(r'<th[^>]*>(.*?)</th>\s*<td[^>]*>(.*?)</td>', html, flags=re.I|re.S)
+    pairs += re.findall(r'<th[^>]*>(.*?)</th>\s*<td[^>]*>(.*?)</td>', html, flags=re.I|re/S)
     pairs += re.findall(
         r'<(?:span|div)[^>]*class="[^"]*(?:tit|title)[^"]*"[^>]*>(.*?)</(?:span|div)>\s*'
         r'<(?:span|div)[^>]*class="[^"]*(?:val|desc|value)[^"]*"[^>]*>(.*?)</(?:span|div)>',
@@ -1178,15 +1176,12 @@ def parse_title_brand_model_variant(title: str):
 def _coerce_float(x):
     try:
         s = str(x).strip()
-        # remove everything except digits, dot, exp markers, sign
         s = re.sub(r"[^0-9.\-+eE]", "", s)
-        # collapse thousands-like extra dots (e.g., 123.456.789 -> 123456789)
         parts = s.split(".")
         if len(parts) > 2:
-            s = parts[0] + "." + "".join(parts[1:])  # keep first dot as decimal
-            # If this still looks like an integer grouping case, fallback to removing all dots:
+            s = parts[0] + "." + "".join(parts[1:])
             if not re.match(r"^-?\d+(\.\d+)?([eE][+-]?\d+)?$", s):
-                s = "".join(parts)  # no decimal; pure integer
+                s = "".join(parts)
         return float(s)
     except:
         return None
@@ -1320,9 +1315,8 @@ def _extract_carid_from_state_or_url(state, url: str) -> str:
     q = deque([state]); seen=set()
     while q and not cand:
         cur = q.popleft()
-        oid = id(cur)
-        if oid in seen: continue
-        seen.add(oid)
+        if id(cur) in seen: continue
+        seen.add(id(cur))
         if isinstance(cur, dict):
             for k,v in cur.items():
                 lk = str(k).lower()
@@ -1681,16 +1675,13 @@ def get_paging_info(browser):
         pass
     return page, total_pages
 
-
-
 @contextmanager
 def build_browser():
     """
     One unique Chrome profile per run.
-    No headless=False, no shared user-data-dir.
+    No headless=False, no shared user-data-dir (unless provided via env).
     """
     opts = Options()
-
     # Headless + CI-safe flags
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -1700,25 +1691,11 @@ def build_browser():
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-features=NetworkServiceInProcess")
-    opts.add_argument("--remote-debugging-port=9222")
-    # Reduce “automation” fingerprints
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
+
     # Respect setup-chrome path if provided
-    chrome_bin = (os.environ.get("CHROME_BIN")
-                  or shutil.which("chromium")
-                  or shutil.which("chromium-browser")
-                  or shutil.which("google-chrome")
-                  or shutil.which("chrome"))
+    chrome_bin = os.environ.get("CHROME_BIN")
     if chrome_bin:
         opts.binary_location = chrome_bin
-    # UA helps some sites in headless mode
-    opts.add_argument(
-        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
 
     # Auto-translate KR -> EN
     opts.add_experimental_option("prefs", {
@@ -1727,34 +1704,24 @@ def build_browser():
         "translate": {"enabled": True},
     })
 
-    # ALWAYS use a unique, throwaway user-data-dir
-    profile_dir = tempfile.mkdtemp(prefix=f"encar-chrome-{uuid.uuid4().hex[:8]}-")
+    # Unique user-data-dir; prefer the one workflow created
+    external_profile = os.environ.get("CHROME_USER_DATA_DIR")
+    if external_profile:
+        profile_dir = external_profile
+        cleanup_profile = False
+    else:
+        profile_dir = tempfile.mkdtemp(prefix=f"encar-chrome-{uuid.uuid4().hex[:8]}-")
+        cleanup_profile = True
     cache_dir   = tempfile.mkdtemp(prefix=f"encar-cache-{uuid.uuid4().hex[:8]}-")
+
     opts.add_argument(f"--user-data-dir={profile_dir}")
     opts.add_argument(f"--profile-directory=Profile-Default")
     opts.add_argument(f"--disk-cache-dir={cache_dir}")
 
-    # DO NOT pass headless=False here – we already set headless via opts
-    def _chrome_major(path):
-        try:
-            out = subprocess.check_output([path, "--version"], text=True).strip()
-            # e.g. "Chromium 143.0.7445.0" → "143"
-            import re
-            m = re.search(r"(\d+)\.", out)
-            return m.group(1) if m else None
-        except Exception:
-            return None
-    major = _chrome_major(chrome_bin) if chrome_bin else None
-    from webdriver_manager.chrome import ChromeDriverManager
-    # webdriver-manager v4.x: match Chromium build automatically
-    driver_path = ChromeDriverManager(
-        chrome_type=ChromeType.CHROMIUM,
-        driver_version=None   # let it auto-detect based on installed Chromium
-    ).install()    
-    service = Service(driver_path)
-    br = Browser("chrome", options=opts, service=service)
+    # Let Selenium Manager find & provision the correct chromedriver
+    br = Browser("chrome", options=opts)
+
     try:
-        # Reasonable timeouts for CI
         try:
             br.driver.set_page_load_timeout(45)
             br.driver.set_script_timeout(30)
@@ -1762,11 +1729,15 @@ def build_browser():
             pass
         yield br
     finally:
-         try:
-             br.quit()
-         except Exception:
-             pass
-        
+        try:
+            br.quit()
+        except Exception:
+            pass
+        # Clean up only our temp dirs (not the external one from the workflow)
+        if cleanup_profile:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        shutil.rmtree(cache_dir,   ignore_errors=True)
+
 def main():
     with build_browser() as browser:
         browser.visit(BASE_URL)
@@ -1926,7 +1897,7 @@ def main():
                     }
                     row_out = fill_blanks_in_row(row_out)
 
-                    # ✅ Correct WRITE_DB logic
+                    # Optional direct DB write (kept for local runs)
                     if WRITE_DB:
                         missing = [v for v in ("DB_HOST","DB_PORT","DB_USERNAME","DB_PASSWORD","DB_DATABASE") if not os.getenv(v)]
                         if missing:
@@ -1934,7 +1905,7 @@ def main():
                         else:
                             upsert_vehicle(row_out)
 
-                    # write the CSV row regardless of DB
+                    # Always write CSV; your workflow imports it afterward
                     writer.writerow(row_out)
 
                     total_done += 1
@@ -1946,7 +1917,6 @@ def main():
                 total_pages = tp or total_pages
 
         print(f"🎯 Finished. Saved to {csv_path}")
-
 
 if __name__ == "__main__":
     main()
