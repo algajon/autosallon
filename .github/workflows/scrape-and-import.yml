@@ -107,7 +107,7 @@ jobs:
         run: |
           set -euo pipefail
           ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "MYSQL_PWD='${DB_PASS}' mysql --protocol=TCP --ssl-mode=REQUIRED \
+            "MYSQL_PWD='${DB_PASS}' mysql --protocol=TCP \
                -h srv1802.hstgr.io -u '${DB_USER}' \
                -e \"SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;\" '${DB_NAME}'"
 
