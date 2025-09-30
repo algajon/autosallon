@@ -2,3 +2,4 @@ selenium>=4.21
 splinter>=0.21.0 
 pymysql>=1.1.0 
 python-dotenv>=1.0.1
+webdriver-manager>=4.0.1
