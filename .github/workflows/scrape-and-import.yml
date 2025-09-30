@@ -3,7 +3,7 @@ name: Scrape & Import (Hostinger via SSH tunnel)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *" # run hourly at :17
+    - cron: "17 * * * *"
 
 permissions:
   contents: read
@@ -18,11 +18,8 @@ jobs:
     timeout-minutes: 45
 
     env:
-      # Local endpoint on the runner
       TUNNEL_HOST: 127.0.0.1
       TUNNEL_PORT: 3307
-
-      # Scraper output
       CSV_DIR: ${{ secrets.CSV_DIR != '' && secrets.CSV_DIR || 'scripts' }}
       CSV_NAME: cars.csv
       KRW_EUR: ${{ secrets.KRW_EUR != '' && secrets.KRW_EUR || '0.000615' }}
@@ -31,27 +28,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Install system deps (MySQL client, SSH)
         run: |
           sudo apt-get update
           sudo apt-get install -y mysql-client openssh-client
 
-      # --- SSH key-only auth (no password fallback) ---
       - name: Prepare SSH key (key-only; no password)
         env:
-          SSH_KEY:  ${{ secrets.HOSTINGER_SSH_KEY }}
+          SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           if ! ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null 2>&1; then
-            echo "The private key in HOSTINGER_SSH_KEY appears invalid or passphrase-protected."
+            echo "HOSTINGER_SSH_KEY is invalid or passphrase-protected."
             exit 1
           fi
           cat > ~/.ssh/config <<'CFG'
@@ -63,52 +54,34 @@ jobs:
             PasswordAuthentication no
             StrictHostKeyChecking no
           CFG
-          
-      - name: Sanity check from SSH host → Hostinger MySQL
-        env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}     # 46.202.156.167
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          DB_NAME:  ${{ secrets.DB_DATABASE }}           # exact prefixed name from hPanel
-          DB_USER:  ${{ secrets.DB_USERNAME }}           # exact prefixed user from hPanel
-          DB_PASS:  ${{ secrets.DB_PASSWORD }}
-        run: |
-          set -euo pipefail
-          ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "MYSQL_PWD='${DB_PASS}' mysql --protocol=TCP -h srv1802.hstgr.io -u '${DB_USER}' \
-             -e \"SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;\" '${DB_NAME}'"
 
-      - name: Try SSH auth once (verbose)
+      - name: Sanity: SSH auth
         env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}   # 46.202.156.167
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
         run: |
           set -e
           ssh -vvv -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-              -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'Auth OK'; exit"
+            -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'SSH OK'; exit"
 
-      # IMPORTANT: forward to srv1802.hstgr.io:3306 so Hostinger sees source IP = 46.202.156.167
-      - name: Start SSH tunnel (runner:3307 → 46.202.156.167 → srv1802.hstgr.io:3306 over IPv4)
+      - name: Start SSH tunnel (runner:3307 → bastion → Hostinger MySQL over IPv4)
         env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}   # your bastion, e.g. 46.202.156.167
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}        # 46.202.156.167
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          TUNNEL_PORT: 3307
-          # Use Hostinger's IPv4 directly to avoid AAAA/IPv6:
-          REMOTE_DB_IPV4: 92.113.22.50
+          REMOTE_DB_HOST: ${{ secrets.REMOTE_DB_HOST }}      # 92.113.22.50
         run: |
           set -euo pipefail
-          # -4 forces IPv4 for the SSH connection; using numeric IPv4 for the DB target
+          # Force IPv4 end-to-end and forward to Hostinger DB IPv4
           ssh -f -N -4 \
             -o ExitOnForwardFailure=yes \
             -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-            -L ${TUNNEL_PORT}:${REMOTE_DB_IPV4}:3306 \
+            -L ${TUNNEL_PORT}:${REMOTE_DB_HOST}:3306 \
             -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
-
           for i in {1..20}; do
             if ss -lnt | grep -q ":${TUNNEL_PORT}"; then
-              echo "Tunnel up on ${TUNNEL_PORT} -> ${REMOTE_DB_IPV4}:3306 via ${SSH_HOST}"
+              echo "Tunnel up: ${TUNNEL_HOST}:${TUNNEL_PORT} -> ${REMOTE_DB_HOST}:3306 via ${SSH_HOST}"
               exit 0
             fi
             sleep 0.5
@@ -116,10 +89,11 @@ jobs:
           echo "Tunnel did not open" >&2
           exit 1
 
-      # --- Run your scraper (writes CSV to $CSV_DIR/$CSV_NAME) ---
-      - name: Install Python requirements
-        run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      # === Your scraper (writes CSV to $CSV_DIR/$CSV_NAME) ===
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Prepare unique Chrome profile dir
         run: |
@@ -131,42 +105,41 @@ jobs:
           pkill -f chrome || true
           pkill -f chromedriver || true
 
+      - name: Install Python requirements
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
       - name: Run scraper
         env:
           KRW_EUR: ${{ env.KRW_EUR }}
         run: |
           set -euo pipefail
           mkdir -p "$CSV_DIR"
-          # === replace with your real entrypoint if different ===
           python scripts/github.py
-          # ======================================================
           test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
-      # --- Import CSV into MySQL over the tunnel ---
+      # === MySQL import (explicit -p so we 100% send a password) ===
       - name: Import CSV into MySQL (UPSERT)
         env:
           DB_DATABASE: ${{ secrets.DB_DATABASE }}
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          CSV_DIR: ${{ env.CSV_DIR }}
-          CSV_NAME: ${{ env.CSV_NAME }}
         run: |
           set -euo pipefail
           [[ -n "${DB_DATABASE:-}" ]] || { echo "DB_DATABASE missing"; exit 1; }
           [[ -n "${DB_USERNAME:-}" ]] || { echo "DB_USERNAME missing"; exit 1; }
           [[ -n "${DB_PASSWORD:-}" ]] || { echo "DB_PASSWORD missing"; exit 1; }
 
+          HOST="${TUNNEL_HOST}"
+          PORT="${TUNNEL_PORT}"
           CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
-          HOST=127.0.0.1
-          PORT=3307
 
           echo "MySQL ping/version:"
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" \
             -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;" "$DB_DATABASE"
 
-          # Staging table
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
           DROP TABLE IF EXISTS stg_encar;
@@ -190,7 +163,6 @@ jobs:
           ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
 
-          # Load CSV → staging
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" --execute="
             SET SESSION local_infile=1;
@@ -204,7 +176,6 @@ jobs:
              transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
           " "$DB_DATABASE"
 
-          # Ensure final table + unique index (idempotent)
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
             "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "$DB_DATABASE"
@@ -219,7 +190,6 @@ jobs:
               "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "$DB_DATABASE"
           fi
 
-          # Upsert
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
           INSERT INTO vehicles (
