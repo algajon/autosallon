@@ -19,6 +19,7 @@ and **forces the list to lazy-load all rows** so it won’t stop after ~5.
 from splinter import Browser
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from webdriver_manager.core.utils import ChromeType
 import time, os, json, csv, re
 from webdriver_manager.chrome import ChromeDriverManager
 from collections import deque
@@ -1706,11 +1707,11 @@ def build_browser():
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     # Respect setup-chrome path if provided
-    chrome_bin = os.environ.get("CHROME_BIN") or \
-                 shutil.which("google-chrome") or \
-                 shutil.which("chrome") or \
-                 shutil.which("chromium") or \
-                 shutil.which("chromium-browser")
+    chrome_bin = (os.environ.get("CHROME_BIN")
+                  or shutil.which("chromium")
+                  or shutil.which("chromium-browser")
+                  or shutil.which("google-chrome")
+                  or shutil.which("chrome"))
     if chrome_bin:
         opts.binary_location = chrome_bin
     # UA helps some sites in headless mode
@@ -1745,8 +1746,11 @@ def build_browser():
             return None
     major = _chrome_major(chrome_bin) if chrome_bin else None
     from webdriver_manager.chrome import ChromeDriverManager
-    driver_path = ChromeDriverManager(version=major if major else None).install()
-    service = Service(driver_path)
+    # webdriver-manager v4.x: match Chromium build automatically
+    driver_path = ChromeDriverManager(
+        chrome_type=ChromeType.CHROMIUM,
+        driver_version=None   # let it auto-detect based on installed Chromium
+    ).install()    service = Service(driver_path)
     br = Browser("chrome", options=opts, service=service)
     try:
         # Reasonable timeouts for CI
