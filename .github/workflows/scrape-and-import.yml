@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 45
 
     env:
+      TUNNEL_HOST: 127.0.0.1
+      TUNNEL_PORT: 3307
       CSV_DIR: ${{ secrets.CSV_DIR != '' && secrets.CSV_DIR || 'scripts' }}
       CSV_NAME: cars.csv
       KRW_EUR: ${{ secrets.KRW_EUR != '' && secrets.KRW_EUR || '0.000615' }}
@@ -26,16 +28,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install minimal deps (SSH client only)
+      - name: Install system deps (MySQL client, SSH)
         run: |
           sudo apt-get update
-          sudo apt-get install -y openssh-client
+          sudo apt-get install -y mysql-client openssh-client
 
       - name: Prepare SSH key (key-only; no password)
         env:
           SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
@@ -59,13 +61,44 @@ jobs:
           SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
           SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
         run: |
-          ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo SSH OK"
+          set -e
+          ssh -vvv -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
+            -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo 'SSH OK'; exit"
 
-      # ---------- SCRAPER ----------
+      - name: Start SSH tunnel (runner:3307 → bastion → Hostinger MySQL over IPv4)
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}        # 46.202.156.167
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          REMOTE_DB_HOST: ${{ secrets.REMOTE_DB_HOST }}      # 92.113.22.50
+        run: |
+          set -euo pipefail
+          # Force IPv4 end-to-end and forward to Hostinger DB IPv4
+          ssh -f -N -4 \
+            -o ExitOnForwardFailure=yes \
+            -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
+            -L ${TUNNEL_PORT}:${REMOTE_DB_HOST}:3306 \
+            -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}"
+          for i in {1..20}; do
+            if ss -lnt | grep -q ":${TUNNEL_PORT}"; then
+              echo "Tunnel up: ${TUNNEL_HOST}:${TUNNEL_PORT} -> ${REMOTE_DB_HOST}:3306 via ${SSH_HOST}"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "Tunnel did not open" >&2
+          exit 1
+
+      # === Your scraper (writes CSV to $CSV_DIR/$CSV_NAME) ===
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Prepare unique Chrome profile dir
+        run: |
+          echo "CHROME_USER_DATA_DIR=$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> $GITHUB_ENV
+          mkdir -p "$RUNNER_TEMP/chrome-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
       - name: Clean stale Chrome (best-effort)
         run: |
@@ -80,53 +113,37 @@ jobs:
         env:
           KRW_EUR: ${{ env.KRW_EUR }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p "$CSV_DIR"
           python scripts/github.py
-          test -s "${CSV_DIR}/${CSV_NAME}" || { echo "CSV not found at ${CSV_DIR}/${CSV_NAME}"; exit 1; }
+          test -s "${CSV_DIR}/${CSV_NAME}" || (echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1)
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
-      # ---------- PUSH CSV + IMPORT (batched UPSERTs; no LOAD DATA) ----------
-      - name: Create importer script (local)
+      # === MySQL import (explicit -p so we 100% send a password) ===
+      - name: Import CSV into MySQL (UPSERT)
+        env:
+          DB_DATABASE: ${{ secrets.DB_DATABASE }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
-          cat > importer.py <<'PY'
-          #!/usr/bin/env python3
-          import os, sys, csv, ssl
-          import pymysql
+          set -euo pipefail
+          [[ -n "${DB_DATABASE:-}" ]] || { echo "DB_DATABASE missing"; exit 1; }
+          [[ -n "${DB_USERNAME:-}" ]] || { echo "DB_USERNAME missing"; exit 1; }
+          [[ -n "${DB_PASSWORD:-}" ]] || { echo "DB_PASSWORD missing"; exit 1; }
 
-          host     = os.environ['DB_HOST']
-          user     = os.environ['DB_USER']
-          password = os.environ['DB_PASS']
-          database = os.environ['DB_NAME']
-          csv_path = os.environ['CSV_PATH']
+          HOST="${TUNNEL_HOST}"
+          PORT="${TUNNEL_PORT}"
+          CSV_PATH="$(pwd)/${CSV_DIR}/${CSV_NAME}"
 
-          def to_int(x):
-            if x is None: return None
-            s = str(x).strip()
-            if not s or s.lower() in {"null","none","nan"}: return None
-            s = s.replace(",","")
-            try: return int(float(s))
-            except: return None
+          echo "MySQL ping/version:"
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" \
+            -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;" "$DB_DATABASE"
 
-          def connect():
-            # Try plain first; if server enforces TLS, fall back with TLS (no verify)
-            try:
-              return pymysql.connect(host=host, user=user, password=password, database=database,
-                                     port=3306, charset="utf8mb4", connect_timeout=15)
-            except Exception:
-              ctx = ssl.create_default_context()
-              ctx.check_hostname = False
-              ctx.verify_mode = ssl.CERT_NONE
-              return pymysql.connect(host=host, user=user, password=password, database=database,
-                                     port=3306, charset="utf8mb4", connect_timeout=15, ssl={"ssl": ctx})
-
-          conn = connect()
-          cur = conn.cursor()
-          cur.execute("SELECT @@version, CURRENT_USER(), USER()")
-          print("server,cur_user,login_user:", cur.fetchone(), flush=True)
-
-          cur.execute("""
-          CREATE TABLE IF NOT EXISTS vehicles (
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
+          DROP TABLE IF EXISTS stg_encar;
+          CREATE TABLE stg_encar (
             prodhuesi        VARCHAR(80),
             modeli           VARCHAR(120),
             varianti         VARCHAR(160),
@@ -143,20 +160,46 @@ jobs:
             listing_url      VARCHAR(512),
             opsionet         MEDIUMTEXT,
             raporti_url      TEXT
-          ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-          """)
-          cur.execute("""
-          SELECT COUNT(1) FROM information_schema.statistics
-          WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url'
-          """)
-          if cur.fetchone()[0] == 0:
-            cur.execute("ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255))")
+          ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+          SQL
 
-          cols = ("prodhuesi","modeli","varianti","viti","cmimi_eur","kilometrazhi_km","karburanti","ngjyra",
-                  "transmisioni","uleset","vin","engine_cc","images","listing_url","opsionet","raporti_url")
-          placeholders = ",".join(["%s"]*len(cols))
-          sql = f"""
-          INSERT INTO vehicles ({",".join(cols)}) VALUES ({placeholders})
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" --execute="
+            SET SESSION local_infile=1;
+            LOAD DATA LOCAL INFILE '${CSV_PATH}'
+            INTO TABLE stg_encar
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','  ENCLOSED BY '\"'
+            LINES TERMINATED BY '\n'
+            IGNORE 1 LINES
+            (prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+             transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url);
+          " "$DB_DATABASE"
+
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
+            "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "$DB_DATABASE"
+
+          HAS_IDX="$(mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -N -B -e \
+            "SELECT COUNT(1) FROM information_schema.statistics
+             WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url';" "$DB_DATABASE")"
+          if [ "$HAS_IDX" -eq 0 ]; then
+            mysql --protocol=TCP --ssl-mode=REQUIRED \
+              -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e \
+              "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "$DB_DATABASE"
+          fi
+
+          mysql --protocol=TCP --ssl-mode=REQUIRED \
+            -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
+          INSERT INTO vehicles (
+            prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+            transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
+          )
+          SELECT
+            prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
+            transmisioni, uleset, vin, engine_cc, images, listing_url, opsionet, raporti_url
+          FROM stg_encar
           ON DUPLICATE KEY UPDATE
             prodhuesi=VALUES(prodhuesi),
             modeli=VALUES(modeli),
@@ -172,122 +215,5 @@ jobs:
             engine_cc=VALUES(engine_cc),
             images=VALUES(images),
             opsionet=VALUES(opsionet),
-            raporti_url=VALUES(raporti_url)
-          """
-
-          total = 0
-          batch, BATCH_SIZE = [], 500
-
-          with open(csv_path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for r in reader:
-              batch.append((
-                r.get("prodhuesi"),
-                r.get("modeli"),
-                r.get("varianti"),
-                r.get("viti"),
-                to_int(r.get("cmimi_eur")),
-                to_int(r.get("kilometrazhi_km")),
-                r.get("karburanti"),
-                r.get("ngjyra"),
-                r.get("transmisioni"),
-                r.get("uleset"),
-                r.get("vin"),
-                to_int(r.get("engine_cc")),
-                r.get("images"),
-                r.get("listing_url"),
-                r.get("opsionet"),
-                r.get("raporti_url"),
-              ))
-              if len(batch) >= BATCH_SIZE:
-                cur.executemany(sql, batch); conn.commit(); total += len(batch); batch.clear()
-          if batch:
-            cur.executemany(sql, batch); conn.commit(); total += len(batch)
-
-          print(f"upserted_rows={total}", flush=True)
-          cur.close(); conn.close()
-          PY
-
-      - name: Push CSV + importer to SSH host
-        env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          CSV_DIR: ${{ env.CSV_DIR }}
-          CSV_NAME: ${{ env.CSV_NAME }}
-        run: |
-          set -e
-          LOCAL_CSV="$GITHUB_WORKSPACE/${CSV_DIR}/${CSV_NAME}"
-          test -s "$LOCAL_CSV" || { echo "CSV not found at $LOCAL_CSV"; exit 1; }
-
-          REMOTE_DIR="/tmp/encar_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
-          REMOTE_CSV="${REMOTE_DIR}/cars.csv"
-          REMOTE_SCRIPT="${REMOTE_DIR}/importer.py"
-
-          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$REMOTE_DIR'"
-          scp -P "$SSH_PORT" -i ~/.ssh/id_ed25519 "$LOCAL_CSV" "$SSH_USER@$SSH_HOST:$REMOTE_CSV"
-          scp -P "$SSH_PORT" -i ~/.ssh/id_ed25519 importer.py "$SSH_USER@$SSH_HOST:$REMOTE_SCRIPT"
-
-          echo "REMOTE_DIR=$REMOTE_DIR"         >> $GITHUB_ENV
-          echo "REMOTE_CSV=$REMOTE_CSV"         >> $GITHUB_ENV
-          echo "REMOTE_SCRIPT=$REMOTE_SCRIPT"   >> $GITHUB_ENV
-
-      - name: Import on SSH host (Python; no LOAD DATA)
-        env:
-          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
-          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-          DB_NAME:  ${{ secrets.DB_DATABASE }}
-          DB_USER:  ${{ secrets.DB_USERNAME }}
-          DB_PASS:  ${{ secrets.DB_PASSWORD }}
-          REMOTE_CSV: ${{ env.REMOTE_CSV }}
-          REMOTE_SCRIPT: ${{ env.REMOTE_SCRIPT }}
-        run: |
-          set -e
-          # Ensure a usable Python and PyMySQL on the SSH host (user-space only; no sudo required)
-          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -s <<'REMOTE'
-          set -e
-          PY="$(command -v python3 || command -v python || true)"
-          if [ -z "$PY" ]; then
-            echo "No python found on SSH host. Attempting user-space bootstrap..."
-            # Quick user-space bootstrap via pyenv-ish fallback (skipped here to keep it lean)
-            echo "Please install python3 on the SSH host." >&2
-            exit 1
-          fi
-          "$PY" - <<'PYCHK'
-           import sys, subprocess
-           try:
-             import pymysql  # noqa: F401
-             print("pymysql: OK")
-           except Exception:
-             print("pymysql: installing...", flush=True)
-             try:
-               import ensurepip, site  # noqa: F401
-               ensurepip.bootstrap()
-             except Exception:
-               pass
-             subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "pymysql"])
-             import pymysql  # re-check
-             print("pymysql: installed")
-           PYCHK
-                     REMOTE
-
-                     # Run importer with env (password masked by Actions)
-                     ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-                       DB_HOST="srv1802.hstgr.io" \
-                       DB_NAME="$DB_NAME" \
-                       DB_USER="$DB_USER" \
-                       DB_PASS="$DB_PASS" \
-                       CSV_PATH="$REMOTE_CSV" \
-                       "python3 '$REMOTE_SCRIPT' || python '$REMOTE_SCRIPT'"
-
-                 - name: Cleanup remote temp files (best-effort)
-                   if: always()
-                   env:
-                     SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
-                     SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
-                     SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
-                     REMOTE_DIR: ${{ env.REMOTE_DIR }}
-                   run: |
-                     ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "rm -rf '$REMOTE_DIR' || true"
-
+            raporti_url=VALUES(raporti_url);
+          SQL
