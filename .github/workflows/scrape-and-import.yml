@@ -26,10 +26,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system deps (MySQL client, SSH)
+      - name: Install system deps (MariaDB client, SSH)
         run: |
           sudo apt-get update
-          sudo apt-get install -y mysql-client openssh-client
+          sudo apt-get install -y mariadb-client openssh-client
 
       - name: Prepare SSH key (key-only; no password)
         env:
@@ -107,9 +107,9 @@ jobs:
         run: |
           set -euo pipefail
           ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "MYSQL_PWD='${DB_PASS}' mysql --protocol=TCP \
+            "MYSQL_PWD='${DB_PASS}' mariadb --protocol=TCP --ssl \
                -h srv1802.hstgr.io -u '${DB_USER}' \
-               -e \"SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;\" '${DB_NAME}'"
+               -e \"SELECT @@version AS version, CURRENT_USER() AS cur_user, USER() AS login_user;\" '${DB_NAME}'"
 
       # ---------- COPY CSV & IMPORT FROM SSH HOST ----------
       - name: Upload CSV to SSH host
@@ -153,15 +153,15 @@ jobs:
              bash -s" <<'REMOTE'
           set -euo pipefail
 
-          # Ensure mysql client is present (best-effort)
-          command -v mysql >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y mysql-client || true; }
+          # Ensure mariadb client is present (best-effort)
+          command -v mariadb >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y mariadb-client || true; }
 
           echo "MySQL ping/version (from SSH host):"
-          MYSQL_PWD="$DB_PASS" mysql --protocol=TCP --ssl-mode=REQUIRED \
-            -h "$DB_HOST" -u "$DB_USER" -e "SELECT VERSION(), CURRENT_USER(), USER();" "$DB_NAME"
+          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
+            -h "$DB_HOST" -u "$DB_USER" -e "SELECT @@version AS version, CURRENT_USER() AS cur_user, USER() AS login_user;" "$DB_NAME"
 
           # Create staging
-          MYSQL_PWD="$DB_PASS" mysql --protocol=TCP --ssl-mode=REQUIRED \
+          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
             -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" <<'SQL'
           DROP TABLE IF EXISTS stg_encar;
           CREATE TABLE stg_encar (
@@ -185,7 +185,7 @@ jobs:
           SQL
 
           # Load CSV → staging
-          MYSQL_PWD="$DB_PASS" mysql --protocol=TCP --ssl-mode=REQUIRED --local-infile=1 \
+          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl --local-infile=1 \
             -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" --execute="
             SET SESSION local_infile=1;
             LOAD DATA LOCAL INFILE '${CSV_PATH}'
@@ -199,21 +199,21 @@ jobs:
           "
 
           # Ensure final table + unique index (idempotent)
-          MYSQL_PWD="$DB_PASS" mysql --protocol=TCP --ssl-mode=REQUIRED \
+          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
             -h "$DB_HOST" -u "$DB_USER" -e "CREATE TABLE IF NOT EXISTS vehicles LIKE stg_encar;" "$DB_NAME"
 
-          HAS_IDX="$(MYSQL_PWD="$DB_PASS" mysql --protocol=TCP --ssl-mode=REQUIRED \
+          HAS_IDX="$(MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
             -h "$DB_HOST" -u "$DB_USER" -N -B -e \
             "SELECT COUNT(1) FROM information_schema.statistics
              WHERE table_schema = DATABASE() AND table_name='vehicles' AND index_name='uniq_listing_url';" "$DB_NAME")"
           if [ "$HAS_IDX" -eq 0 ]; then
-            MYSQL_PWD="$DB_PASS" mysql --protocol=TCP --ssl-mode=REQUIRED \
+            MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
               -h "$DB_HOST" -u "$DB_USER" -e \
               "ALTER TABLE vehicles ADD UNIQUE KEY uniq_listing_url (listing_url(255));" "$DB_NAME"
           fi
 
           # Upsert
-          MYSQL_PWD="$DB_PASS" mysql --protocol=TCP --ssl-mode=REQUIRED \
+          MYSQL_PWD="$DB_PASS" mariadb --protocol=TCP --ssl \
             -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" <<'SQL'
           INSERT INTO vehicles (
             prodhuesi, modeli, varianti, viti, cmimi_eur, kilometrazhi_km, karburanti, ngjyra,
