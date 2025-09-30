@@ -138,7 +138,6 @@ jobs:
           echo "MySQL ping/version:"
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" \
-            -e "SELECT VERSION() AS version, CURRENT_USER() AS current_user, USER() AS login_user;" "$DB_DATABASE"
 
           mysql --protocol=TCP --ssl-mode=REQUIRED \
             -h "$HOST" -P "$PORT" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" <<'SQL'
