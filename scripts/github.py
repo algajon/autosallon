@@ -357,6 +357,118 @@ def get_full_state(browser):
         pass
     return {}
 
+def list_row_dom_extract(row):
+    """
+    Minimal, DOM-only extraction from a list row:
+      - title
+      - href (detail link)
+      - priceText (raw, human text)
+      - priceNum (numeric; KRW if we can coerce)
+      - row_html (for downstream price parsing fallbacks)
+    """
+    rec = {"title": "", "priceText": "", "priceNum": None, "href": "", "row_html": ""}
+
+    # Row HTML snapshot
+    try:
+        rec["row_html"] = row.html or ""
+    except Exception:
+        rec["row_html"] = ""
+
+    # --- HREF + TITLE ---
+    def _grab_link_and_title():
+        sels = [
+            'td.inf a.newLink._link',
+            'td.img a.newLink._link',
+            'a[data-enlog-dt-eventname="차량상세"]',
+            'a[href*="/dc/dc_cardetailview"]',
+            'a[href*="/cars/detail/"]',
+            'a[href]'
+        ]
+        for sel in sels:
+            try:
+                els = row.find_by_css(sel)
+                if not els:
+                    continue
+                el = els.first
+                href = ""
+                try:
+                    href = el["href"]
+                except Exception:
+                    href = ""
+                title_txt = ""
+                try:
+                    title_txt = (el.text or "").strip()
+                except Exception:
+                    title_txt = ""
+                if not title_txt:
+                    # Fallback: strip tags from the anchor’s inner HTML
+                    try:
+                        inner = el.html or ""
+                        inner = re.sub(r"<[^>]+>", " ", inner)
+                        title_txt = re.sub(r"\s+", " ", inner).strip()
+                    except Exception:
+                        pass
+                if href or title_txt:
+                    return href, title_txt
+            except Exception:
+                pass
+        return "", ""
+
+    href, title_txt = _grab_link_and_title()
+    rec["href"] = href
+    rec["title"] = title_txt
+
+    # --- PRICE TEXT + NUM ---
+    # First, try obvious price containers
+    def _pick_price_text():
+        sels = [
+            '.pay', '.price', 'td.price', 'span.price', '[class*="price"]',
+            '[class*="prc"]', '[id*="price"]', '.car_price'
+        ]
+        for sel in sels:
+            try:
+                els = row.find_by_css(sel)
+                if not els:
+                    continue
+                # Find the first element in this selector that parses as a price
+                for el in els:
+                    txt = (el.text or "").strip()
+                    if not txt:
+                        continue
+                    if price_text_to_krw(txt) or re.search(r'[₩￦]|\bwon\b|원|억|만', txt, re.I):
+                        return txt
+            except Exception:
+                pass
+        # Fallback: scan row html with the existing helpers
+        chunks = extract_price_chunks_from_row(rec["row_html"])
+        if chunks:
+            # Prefer a chunk that parses to KRW
+            for c in chunks:
+                if price_text_to_krw(c):
+                    return c
+            return chunks[0]
+        return ""
+
+    ptxt = _pick_price_text()
+    rec["priceText"] = ptxt
+
+    # priceNum tries to be numeric KRW (the later pipeline will normalize it anyway)
+    pnum = None
+    try:
+        if ptxt:
+            # If it has KR money tokens, parse; else leave None and let row_html parsing handle it later
+            if re.search(r'[₩￦]|\bwon\b|원|억|만', ptxt, re.I):
+                pnum = normalize_ad_price_to_krw(ptxt)
+        if (pnum is None or pnum == 0) and rec["row_html"]:
+            cands = parse_price_candidates_from_html(rec["row_html"])
+            if cands:
+                pnum = pick_best_krw(cands)
+    except Exception:
+        pnum = None
+    rec["priceNum"] = pnum if pnum else None
+
+    return rec
+
 def find_first_value(obj, keys):
     q = deque([obj]); seen=set()
     while q:
@@ -2220,9 +2332,17 @@ def main():
                 _, tp = get_paging_info(browser)
                 total_pages = tp or total_pages
 
-        print(f"🎯 Finished. Saved to {csv_path}")
-        with open("scripts/debug.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
+       print(f"🎯 Finished. Saved to {csv_path}")
+       try:
+           debug_dir = os.path.join(APP_ROOT, "scripts")
+           os.makedirs(debug_dir, exist_ok=True)
+           with open(os.path.join(debug_dir, "debug.html"), "w", encoding="utf-8") as f:
+               # Splinter convenience: full current page HTML
+               f.write(browser.html)
+       except Exception as _e:
+           # Non-fatal
+           print(f"[debug-skip] could not write debug.html: {_e}")
+
 
 if __name__ == "__main__":
     main()
