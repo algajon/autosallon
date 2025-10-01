@@ -15,15 +15,18 @@ Encar scraper (Chrome auto-translate -> English)
 This version intentionally **removes all skip logic** (no lease/year filters)
 and **forces the list to lazy-load all rows** so it won’t stop after ~5.
 
-NEW:
-- If list rows are still empty (virtualized UI), we FALL BACK to collecting
-  detail URLs directly from the list page, then continue with the same pipeline.
+HARDENED FALLBACKS:
+- If no <tr data-index> rows AND no <a href> links appear, we:
+  1) Deep-scan __PRELOADED_STATE__ for carid/carno and synthesize detail URLs.
+  2) Probe DOM for data-* attributes (data-carid, data-car-no, etc) and onclick payloads.
+  3) Parse visible text for carid=###### fragments.
+  4) Repeat inside same-origin iframes (if search UI is framed).
 """
 
 from splinter import Browser
 from selenium.webdriver.chrome.options import Options
 import time, os, json, csv, re
-from collections import deque
+from collections import deque, defaultdict
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from selenium.common.exceptions import (
     ElementNotInteractableException,
@@ -163,7 +166,7 @@ BRAND_MAP = {
     "벤츠":"Mercedes-Benz","메르세데스":"Mercedes-Benz","아우디":"Audi","폭스바겐":"Volkswagen",
     "현대":"Hyundai","기아":"Kia","제네시스":"Genesis","볼보":"Volvo","포드":"Ford","지프":"Jeep",
     "렉서스":"Lexus","토요타":"Toyota","닛산":"Nissan","혼다":"Honda","스즈키":"Suzuki",
-    "미니":"MINI","포르쉐":"Porsche","캐딜락":"Cadillac","इन피니티":"Infiniti","쉐보레":"Chevrolet",
+    "미니":"MINI","포르쉐":"Porsche","캐딜락":"Cadillac","इन피니टी":"Infiniti","쉐보레":"Chevrolet",
 }
 
 # ---------------- Helpers ----------------
@@ -256,7 +259,7 @@ def price_text_to_krw(s: str) -> int:
 
     m = re.search(r'(\d[\d\.]*)\s*(won|원)\b', t, re.I)
     if m:
-        try: return int(float(m.group(1).replace(",", "").replace(".", "")))
+        try: return int(float(m.group(1).replace(".", "")))
         except: return 0
 
     m = re.search(r'(\d+(?:\.\d+)?)\s*억(?:\s*(\d+(?:\.\d+)?)\s*만)?', t)
@@ -370,6 +373,69 @@ def find_first_value(obj, keys):
             for v in cur:
                 if isinstance(v,(dict,list)): q.append(v)
     return None
+
+# --------- NEW: deep carid harvesting from state ----------
+CARID_KEY_RE = re.compile(r'car(id|no)\b', re.I)
+def deep_collect_car_records_from_state(state):
+    """
+    Return dict: carid -> {'title','priceText','priceNum'} best-effort,
+    plus a flat list of all carids found.
+    """
+    carids = []
+    by_carid = {}
+    q = deque([state]); seen=set()
+    def _coerce_float(x):
+        try:
+            s = str(x).strip()
+            s = re.sub(r"[^0-9.\-+eE]", "", s)
+            parts = s.split(".")
+            if len(parts) > 2:
+                s = parts[0] + "." + "".join(parts[1:])
+                if not re.match(r"^-?\d+(\.\d+)?([eE][+-]?\d+)?$", s):
+                    s = "".join(parts)
+            return float(s)
+        except:
+            return None
+
+    while q:
+        cur = q.popleft()
+        oid = id(cur)
+        if oid in seen: continue
+        seen.add(oid)
+        if isinstance(cur, dict):
+            keys = {k.lower(): k for k in cur.keys()}
+            cid = None
+            for lk, realk in keys.items():
+                if CARID_KEY_RE.search(lk):
+                    v = str(cur[realk]).strip()
+                    if re.fullmatch(r'\d{6,}', v):
+                        cid = v; break
+            if cid:
+                title = str(cur.get("title") or cur.get("name") or cur.get("carName") or "").strip()
+                priceNum = _coerce_float(cur.get("price") or cur.get("salePrice") or cur.get("listPrice"))
+                priceText = str(cur.get("priceText") or cur.get("price") or cur.get("salePrice") or cur.get("listPrice") or "").strip()
+                carids.append(cid)
+                prev = by_carid.get(cid, {})
+                if title: prev["title"] = title
+                if priceText: prev["priceText"] = priceText
+                if priceNum is not None: prev["priceNum"] = priceNum
+                by_carid[cid] = prev
+            for v in cur.values():
+                if isinstance(v,(dict,list)): q.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v,(dict,list)): q.append(v)
+    return dedup(carids), by_carid
+
+def synth_detail_url(carid: str) -> str:
+    carid = str(carid).strip()
+    if not re.fullmatch(r'\d{6,}', carid): return ""
+    return f"https://fem.encar.com/cars/detail/{carid}"
+
+def synth_legacy_detail_url(carid: str) -> str:
+    carid = str(carid).strip()
+    if not re.fullmatch(r'\d{6,}', carid): return ""
+    return f"https://www.encar.com/dc/dc_cardetailview.do?carid={carid}"
 
 def normalize_body_type(s: str) -> str:
     if not s:
@@ -1261,49 +1327,10 @@ def get_list_records_from_state(state):
                         pnum = _coerce_float(pnum)
                         ptxt = it.get("priceText") or it.get("price") or it.get("salePrice") or it.get("listPrice") or ""
                         href = it.get("link") or it.get("href") or ""
-                        results.append({"idx": i, "title": str(title), "priceText": str(ptxt), "priceNum": pnum, "href": href})
+                        carid = str(it.get("carId") or it.get("carID") or it.get("carNo") or it.get("carno") or "").strip()
+                        if not re.fullmatch(r'\d{6,}', carid): carid = ""
+                        results.append({"idx": i, "title": str(title), "priceText": str(ptxt), "priceNum": pnum, "href": href, "carid": carid})
     return results
-
-def list_row_dom_extract(row):
-    """
-    Extract title, price and href from a list row using the actual Encar markup.
-    """
-    title = ""; priceText = ""; href = ""; html = ""
-    try:
-        html = row.html or ""
-    except:
-        html = ""
-
-    # Title + link (prefer the official detail link)
-    try:
-        link = None
-        for sel in ['td.inf a.newLink._link', 'td.img a.newLink._link', 'a[href*="dc_cardetailview"]']:
-            els = row.find_by_css(sel)
-            if els:
-                link = els.first
-                break
-        if link:
-            title = (link.text or "").strip()
-            try:
-                href = link["href"]
-            except:
-                href = ""
-    except:
-        pass
-
-    # Price cell (e.g., <td class="prc_hs"><strong class="prc">... 원</strong>)
-    try:
-        for sel in ['td.prc_hs .prc', 'td.prc .prc', '[class*="prc"]', '[class*="price"]']:
-            els = row.find_by_css(sel)
-            if els:
-                t = (els.first.text or "").strip()
-                if any(ch.isdigit() for ch in t):
-                    priceText = t
-                    break
-    except:
-        pass
-
-    return {"title": title, "priceText": priceText, "href": href, "priceNum": None, "row_html": html}
 
 PRICE_CELL_RE = re.compile(
     r'(<(?:td|div|span)[^>]*(?:class|id)\s*=\s*"[^"]*(?:prc|price|pay)[^"]*"[^>]*>.*?</(?:td|div|span)>)',
@@ -1746,7 +1773,7 @@ def get_paging_info(browser):
         pass
     return page, total_pages
 
-# ---------------- URL collector (FALLBACK when rows==0) ----------------
+# ---------------- URL collectors (beefed up) ----------------
 LINK_SEL_JS = r"""
 (function(maxWanted){
   function abs(u){ try{ var a=document.createElement('a'); a.href=u; return a.href; }catch(e){ return u||''; } }
@@ -1756,56 +1783,86 @@ LINK_SEL_JS = r"""
     return /\/cars\/detail\/\d+/.test(h) || /dc_cardetailview/.test(h) || /cardetailview/.test(h) || /carid=\d+/.test(h);
   }
   var set = new Set();
-  var anchors = Array.from(document.querySelectorAll('a[href]'));
-  anchors.forEach(function(a){
+
+  // Anchors
+  Array.from(document.querySelectorAll('a[href]')).forEach(function(a){
     var href = a.getAttribute('href')||'';
-    var txt = (a.textContent||'').toLowerCase();
-    if (isDetail(href) || (isDetail(abs(href))) || /detail/.test(txt)){
-      var u = abs(href);
-      if (u) set.add(u);
+    if (isDetail(href) || isDetail(abs(href))) set.add(abs(href));
+  });
+
+  // Buttons / cards with data-* attributes
+  var attrs = ['data-href','data-url','data-carid','data-car-id','data-carno','data-car-no','data-id','data-articleid'];
+  Array.from(document.querySelectorAll('*')).forEach(function(n){
+    for (var i=0;i<attrs.length;i++){
+      var h = n.getAttribute(attrs[i]);
+      if (!h) continue;
+      if (/^\d{6,}$/.test(h)) { set.add('/dc/dc_cardetailview.do?carid='+h); set.add('/cars/detail/'+h); }
+      if (isDetail(h)) set.add(abs(h));
     }
+    var oc = n.getAttribute('onclick')||'';
+    var m = oc.match(/carid\s*=\s*(\d{6,})/i) || oc.match(/cardetailview.*?(\d{6,})/i);
+    if (m){ set.add('/dc/dc_cardetailview.do?carid='+m[1]); set.add('/cars/detail/'+m[1]); }
   });
-  // also check buttons with data-href
-  Array.from(document.querySelectorAll('[data-href]')).forEach(function(n){
-    var h=n.getAttribute('data-href')||'';
-    if (isDetail(h)){ set.add(abs(h)); }
-  });
-  return JSON.stringify(Array.from(set).slice(0, maxWanted||50));
+
+  // Visible text scan (e.g., "carid=1234567")
+  var body = document.body ? document.body.innerText : '';
+  var rx = /carid\s*=\s*(\d{6,})/ig, mm;
+  while ((mm = rx.exec(body))){ set.add('/dc/dc_cardetailview.do?carid='+mm[1]); set.add('/cars/detail/'+mm[1]); }
+
+  // Absolutize, uniquify, limit
+  var list = Array.from(set).map(abs).filter(Boolean);
+  return JSON.stringify(list.slice(0, maxWanted||50));
 })
 """
 
-def collect_listing_urls(browser, want_urls=MAX_LISTINGS, max_scrolls=40, pause=0.4):
+def collect_listing_urls_dom(browser, want_urls=MAX_LISTINGS, max_scrolls=40, pause=0.4):
     urls=[]
-    seen_cnt=-1
-    try:
-        s = browser.evaluate_script(LINK_SEL_JS+"("+str(want_urls*3)+")")
-        if s:
-            urls = json.loads(s) or []
-    except: urls=[]
     tries=0
     while len(urls) < want_urls and tries < max_scrolls:
         tries += 1
-        dismiss_overlays(browser)
         try:
-            browser.execute_script("window.scrollBy(0, 1200);")
+            s = browser.evaluate_script(LINK_SEL_JS+"("+str(want_urls*5)+")")
+            if s: urls = dedup(urls + (json.loads(s) or []))
+        except: pass
+        if len(urls) >= want_urls: break
+        dismiss_overlays(browser)
+        try: 
+            browser.execute_script("window.scrollBy(0, 1400);")
             browser.execute_script("window.dispatchEvent(new Event('scroll'));")
         except: pass
         time.sleep(pause)
+    return urls[:want_urls]
+
+def collect_listing_urls_iframes(browser, want_urls=MAX_LISTINGS):
+    """
+    Same-origin iframes only. We run LINK_SEL_JS inside each.
+    """
+    out=[]
+    try:
+        frames = browser.driver.find_elements("css selector", "iframe")
+    except Exception:
+        frames = []
+    for i, fr in enumerate(frames):
         try:
-            browser.execute_script("window.scrollTo(0, 0);")
-            browser.execute_script("window.dispatchEvent(new Event('scroll'));")
-        except: pass
-        time.sleep(pause*0.75)
-        try:
+            browser.driver.switch_to.frame(fr)
             s = browser.evaluate_script(LINK_SEL_JS+"("+str(want_urls*3)+")")
             if s:
-                cur = json.loads(s) or []
-                urls = dedup(urls + cur)
-        except: pass
-        if len(urls) != seen_cnt:
-            seen_cnt = len(urls)
-            print(f"[collect] found {seen_cnt} detail urls so far...")
-    return urls[:want_urls]
+                out += json.loads(s) or []
+        except Exception:
+            pass
+        finally:
+            try: browser.driver.switch_to.default_content()
+            except: pass
+    return dedup(out)[:want_urls]
+
+def collect_listing_urls_from_state(browser, want_urls=MAX_LISTINGS):
+    st = get_full_state(browser) if wait_for_state(browser, 5) else {}
+    carids, by_carid = deep_collect_car_records_from_state(st)
+    urls = []
+    for cid in carids:
+        u = synth_detail_url(cid) or synth_legacy_detail_url(cid)
+        if u: urls.append(u)
+    return dedup(urls)[:want_urls], by_carid
 
 @contextmanager
 def build_browser():
@@ -1905,30 +1962,55 @@ def main():
             current_page = 1
             _, total_pages = get_paging_info(browser)
 
-            # Check row availability up-front
+            # Up-front state pull (helps fallback pairing)
+            list_state = get_full_state(browser) if wait_for_state(browser, 4) else {}
+            state_records = get_list_records_from_state(list_state)
+
+            # Quick row probe
             rows = find_list_rows(browser)
             rows_count = len(rows)
 
-            # ------- FALLBACK BRANCH: no rows -> collect URLs and proceed -------
+            # ------- HARDENED FALLBACK FLOW -------
             if rows_count == 0:
-                print("[fallback] no list rows found; collecting detail URLs instead...")
-                list_state = get_full_state(browser) if wait_for_state(browser, 3) else {}
-                state_records = get_list_records_from_state(list_state)
+                print("[fallback] no list rows found; trying state-based URLs...")
 
-                urls = collect_listing_urls(browser, want_urls=MAX_LISTINGS, max_scrolls=60, pause=0.4)
+                urls_state, by_carid = collect_listing_urls_from_state(browser, want_urls=MAX_LISTINGS)
+                urls = urls_state[:]
+
+                if not urls:
+                    print("[fallback] state lacked urls; scanning DOM...")
+                    urls_dom = collect_listing_urls_dom(browser, want_urls=MAX_LISTINGS*2)
+                    urls = dedup(urls + urls_dom)
+
+                if not urls:
+                    print("[fallback] DOM empty; scanning iframes...")
+                    urls_ifr = collect_listing_urls_iframes(browser, want_urls=MAX_LISTINGS*2)
+                    urls = dedup(urls + urls_ifr)
+
                 print(f"[fallback] collected {len(urls)} detail urls")
+
+                # Build a fast map from carid->state record (title/price)
+                record_by_cid = defaultdict(dict)
+                for r in state_records:
+                    cid = r.get("carid","")
+                    if cid: record_by_cid[cid] = r
+                for cid, r in by_carid.items():
+                    record_by_cid[cid].update(r)
 
                 i = 0
                 while i < len(urls) and total_done < MAX_LISTINGS:
                     detail_url = urls[i]
-                    # Try to map price/title from state (best-effort by index)
-                    rec = state_records[i] if i < len(state_records) else {}
+                    # carid extraction from the url
+                    m = re.search(r'/detail/(\d{6,})|[?&]carid=(\d{6,})', detail_url)
+                    carid = (m.group(1) or m.group(2)) if m else ""
+
+                    # Pair list info by carid
+                    rec = record_by_cid.get(carid, {})
                     title     = (rec.get("title") or "").strip()
                     priceText = (rec.get("priceText") or "").strip()
                     priceNum  = rec.get("priceNum", None)
 
                     brand, model, variant = parse_title_brand_model_variant(title)
-                    # no row_html available here
                     _krw, eur_list = parse_list_price_eur(priceText, priceNum, "")
 
                     # Open detail directly
@@ -1945,7 +2027,7 @@ def main():
                         "engine_cc_hint": 0,
                         "color_hint": "",
                         "seats_hint": 0,
-                        "inline_report_url": "",  # we can't click inline in fallback
+                        "inline_report_url": "",
                         "title": title,
                     }
 
@@ -1980,11 +2062,10 @@ def main():
                     writer.writerow(row_out)
                     total_done += 1
                     i += 1
-                    print(f"✅ {total_done}/{MAX_LISTINGS} (fallback)")
-
+                    print(f"✅ {total_done}/{MAX_LISTINGS} (fallback-by-carid)")
                 print(f"🎯 Finished. Saved to {csv_path}")
                 return
-            # ---------------------- /FALLBACK BRANCH ---------------------------
+            # ------- /FALLBACK FLOW -------
 
             # ---------------------- NORMAL ROW-BASED BRANCH --------------------
             while total_done < MAX_LISTINGS:
@@ -2038,7 +2119,7 @@ def main():
                     href_raw  = rec.get("href") or ""
 
                     brand, model, variant = parse_title_brand_model_variant(title)
-                    _krw_list, eur_list = parse_list_price_eur(priceText, priceNum, row_html)
+                    krw_list, eur_list = parse_list_price_eur(priceText, priceNum, row_html)
 
                     panel = _get_inline_panel_html(browser, row_index)
                     inline_vals = parse_inline_detail_values(panel)
@@ -2138,7 +2219,6 @@ def main():
                 current_page += 1
                 _, tp = get_paging_info(browser)
                 total_pages = tp or total_pages
-            # ---------------------- /NORMAL ROW-BASED BRANCH -------------------
 
         print(f"🎯 Finished. Saved to {csv_path}")
 
