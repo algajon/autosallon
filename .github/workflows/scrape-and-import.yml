@@ -147,6 +147,11 @@ jobs:
           test -s "${CSV_DIR}/${CSV_NAME}" || { echo "CSV not found at ${CSV_DIR}/${CSV_NAME}" >&2; exit 1; }
           ls -lh "${CSV_DIR}/${CSV_NAME}"
 
+      - name: Upload debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html
+          path: scripts/debug.html
       # === MySQL import (explicit -p so we 100% send a password) ===
       - name: Import CSV into MySQL (UPSERT, no LOCAL INFILE)
         env:
