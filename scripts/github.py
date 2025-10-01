@@ -2332,16 +2332,17 @@ def main():
                 _, tp = get_paging_info(browser)
                 total_pages = tp or total_pages
 
-       print(f"🎯 Finished. Saved to {csv_path}")
-       try:
+           print(f"🎯 Finished. Saved to {csv_path}")
+        
+        try:
            debug_dir = os.path.join(APP_ROOT, "scripts")
            os.makedirs(debug_dir, exist_ok=True)
            with open(os.path.join(debug_dir, "debug.html"), "w", encoding="utf-8") as f:
                # Splinter convenience: full current page HTML
                f.write(browser.html)
-       except Exception as _e:
-           # Non-fatal
-           print(f"[debug-skip] could not write debug.html: {_e}")
+        except Exception as _e:
+       
+        print(f"[debug-skip] could not write debug.html: {_e}")
 
 
 if __name__ == "__main__":
