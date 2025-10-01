@@ -2224,3 +2224,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+with open("scripts/debug.html", "w", encoding="utf-8") as f:
+    f.write(driver.page_source)
