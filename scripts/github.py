@@ -2342,7 +2342,7 @@ def main():
                f.write(browser.html)
         except Exception as _e:
        
-        print(f"[debug-skip] could not write debug.html: {_e}")
+           print(f"[debug-skip] could not write debug.html: {_e}")
 
 
 if __name__ == "__main__":
