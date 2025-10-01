@@ -14,6 +14,10 @@ Encar scraper (Chrome auto-translate -> English)
 
 This version intentionally **removes all skip logic** (no lease/year filters)
 and **forces the list to lazy-load all rows** so it won’t stop after ~5.
+
+NEW:
+- If list rows are still empty (virtualized UI), we FALL BACK to collecting
+  detail URLs directly from the list page, then continue with the same pipeline.
 """
 
 from splinter import Browser
@@ -252,7 +256,7 @@ def price_text_to_krw(s: str) -> int:
 
     m = re.search(r'(\d[\d\.]*)\s*(won|원)\b', t, re.I)
     if m:
-        try: return int(float(m.group(1).replace(".", "")))
+        try: return int(float(m.group(1).replace(",", "").replace(".", "")))
         except: return 0
 
     m = re.search(r'(\d+(?:\.\d+)?)\s*억(?:\s*(\d+(?:\.\d+)?)\s*만)?', t)
@@ -1742,6 +1746,67 @@ def get_paging_info(browser):
         pass
     return page, total_pages
 
+# ---------------- URL collector (FALLBACK when rows==0) ----------------
+LINK_SEL_JS = r"""
+(function(maxWanted){
+  function abs(u){ try{ var a=document.createElement('a'); a.href=u; return a.href; }catch(e){ return u||''; } }
+  function isDetail(h){
+    if(!h) return false;
+    h = String(h);
+    return /\/cars\/detail\/\d+/.test(h) || /dc_cardetailview/.test(h) || /cardetailview/.test(h) || /carid=\d+/.test(h);
+  }
+  var set = new Set();
+  var anchors = Array.from(document.querySelectorAll('a[href]'));
+  anchors.forEach(function(a){
+    var href = a.getAttribute('href')||'';
+    var txt = (a.textContent||'').toLowerCase();
+    if (isDetail(href) || (isDetail(abs(href))) || /detail/.test(txt)){
+      var u = abs(href);
+      if (u) set.add(u);
+    }
+  });
+  // also check buttons with data-href
+  Array.from(document.querySelectorAll('[data-href]')).forEach(function(n){
+    var h=n.getAttribute('data-href')||'';
+    if (isDetail(h)){ set.add(abs(h)); }
+  });
+  return JSON.stringify(Array.from(set).slice(0, maxWanted||50));
+})
+"""
+
+def collect_listing_urls(browser, want_urls=MAX_LISTINGS, max_scrolls=40, pause=0.4):
+    urls=[]
+    seen_cnt=-1
+    try:
+        s = browser.evaluate_script(LINK_SEL_JS+"("+str(want_urls*3)+")")
+        if s:
+            urls = json.loads(s) or []
+    except: urls=[]
+    tries=0
+    while len(urls) < want_urls and tries < max_scrolls:
+        tries += 1
+        dismiss_overlays(browser)
+        try:
+            browser.execute_script("window.scrollBy(0, 1200);")
+            browser.execute_script("window.dispatchEvent(new Event('scroll'));")
+        except: pass
+        time.sleep(pause)
+        try:
+            browser.execute_script("window.scrollTo(0, 0);")
+            browser.execute_script("window.dispatchEvent(new Event('scroll'));")
+        except: pass
+        time.sleep(pause*0.75)
+        try:
+            s = browser.evaluate_script(LINK_SEL_JS+"("+str(want_urls*3)+")")
+            if s:
+                cur = json.loads(s) or []
+                urls = dedup(urls + cur)
+        except: pass
+        if len(urls) != seen_cnt:
+            seen_cnt = len(urls)
+            print(f"[collect] found {seen_cnt} detail urls so far...")
+    return urls[:want_urls]
+
 @contextmanager
 def build_browser():
     """
@@ -1840,6 +1905,88 @@ def main():
             current_page = 1
             _, total_pages = get_paging_info(browser)
 
+            # Check row availability up-front
+            rows = find_list_rows(browser)
+            rows_count = len(rows)
+
+            # ------- FALLBACK BRANCH: no rows -> collect URLs and proceed -------
+            if rows_count == 0:
+                print("[fallback] no list rows found; collecting detail URLs instead...")
+                list_state = get_full_state(browser) if wait_for_state(browser, 3) else {}
+                state_records = get_list_records_from_state(list_state)
+
+                urls = collect_listing_urls(browser, want_urls=MAX_LISTINGS, max_scrolls=60, pause=0.4)
+                print(f"[fallback] collected {len(urls)} detail urls")
+
+                i = 0
+                while i < len(urls) and total_done < MAX_LISTINGS:
+                    detail_url = urls[i]
+                    # Try to map price/title from state (best-effort by index)
+                    rec = state_records[i] if i < len(state_records) else {}
+                    title     = (rec.get("title") or "").strip()
+                    priceText = (rec.get("priceText") or "").strip()
+                    priceNum  = rec.get("priceNum", None)
+
+                    brand, model, variant = parse_title_brand_model_variant(title)
+                    # no row_html available here
+                    _krw, eur_list = parse_list_price_eur(priceText, priceNum, "")
+
+                    # Open detail directly
+                    browser.visit(detail_url)
+                    time.sleep(1.0)
+                    ensure_english(browser, 4)
+                    raw = scrape_detail_raw(browser)
+
+                    list_hint = {
+                        "prodhuesi": brand,
+                        "modeli": model,
+                        "varianti": variant,
+                        "cmimi_eur": eur_list,
+                        "engine_cc_hint": 0,
+                        "color_hint": "",
+                        "seats_hint": 0,
+                        "inline_report_url": "",  # we can't click inline in fallback
+                        "title": title,
+                    }
+
+                    alb = to_albanian_schema(raw, detail_url, list_hint)
+                    row_out = {
+                        "prodhuesi": alb["prodhuesi"],
+                        "modeli": alb["modeli"],
+                        "varianti": alb["varianti"],
+                        "viti": alb["viti"],
+                        "cmimi_eur": alb["cmimi_eur"],
+                        "kilometrazhi_km": alb["kilometrazhi_km"],
+                        "karburanti": alb["karburanti"],
+                        "ngjyra": alb["ngjyra"],
+                        "transmisioni": alb["transmisioni"],
+                        "uleset": "" if alb["uleset"] is None else str(alb["uleset"]),
+                        "vin": alb["vin"],
+                        "engine_cc": alb["engine_cc"],
+                        "images": ";".join(alb.get("images", [])),
+                        "listing_url": alb["listing_url"],
+                        "opsionet": alb["opsionet"],
+                        "raporti_url": alb["raporti_url"],
+                    }
+                    row_out = fill_blanks_in_row(row_out)
+
+                    if WRITE_DB:
+                        missing = [v for v in ("DB_HOST","DB_PORT","DB_USERNAME","DB_PASSWORD","DB_DATABASE") if not os.getenv(v)]
+                        if missing:
+                            print(f"[skip-db] missing {', '.join(missing)}; skipping DB upsert")
+                        else:
+                            upsert_vehicle(row_out)
+
+                    writer.writerow(row_out)
+                    total_done += 1
+                    i += 1
+                    print(f"✅ {total_done}/{MAX_LISTINGS} (fallback)")
+
+                print(f"🎯 Finished. Saved to {csv_path}")
+                return
+            # ---------------------- /FALLBACK BRANCH ---------------------------
+
+            # ---------------------- NORMAL ROW-BASED BRANCH --------------------
             while total_done < MAX_LISTINGS:
                 if current_page > 1:
                     if not go_to_page(browser, current_page):
@@ -1891,7 +2038,7 @@ def main():
                     href_raw  = rec.get("href") or ""
 
                     brand, model, variant = parse_title_brand_model_variant(title)
-                    krw_list, eur_list = parse_list_price_eur(priceText, priceNum, row_html)
+                    _krw_list, eur_list = parse_list_price_eur(priceText, priceNum, row_html)
 
                     panel = _get_inline_panel_html(browser, row_index)
                     inline_vals = parse_inline_detail_values(panel)
@@ -1991,6 +2138,7 @@ def main():
                 current_page += 1
                 _, tp = get_paging_info(browser)
                 total_pages = tp or total_pages
+            # ---------------------- /NORMAL ROW-BASED BRANCH -------------------
 
         print(f"🎯 Finished. Saved to {csv_path}")
 
