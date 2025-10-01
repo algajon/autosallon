@@ -2332,7 +2332,7 @@ def main():
                 _, tp = get_paging_info(browser)
                 total_pages = tp or total_pages
 
-           print(f"🎯 Finished. Saved to {csv_path}")
+        print(f"🎯 Finished. Saved to {csv_path}")
         
         try:
            debug_dir = os.path.join(APP_ROOT, "scripts")
