@@ -2221,9 +2221,9 @@ def main():
                 total_pages = tp or total_pages
 
         print(f"🎯 Finished. Saved to {csv_path}")
+        with open("scripts/debug.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
 
 if __name__ == "__main__":
     main()
 
-with open("scripts/debug.html", "w", encoding="utf-8") as f:
-    f.write(driver.page_source)
