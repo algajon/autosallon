@@ -21,6 +21,10 @@ HARDENED FALLBACKS:
   2) Probe DOM for data-* attributes (data-carid, data-car-no, etc) and onclick payloads.
   3) Parse visible text for carid=###### fragments.
   4) Repeat inside same-origin iframes (if search UI is framed).
+
+Headless-hardening + observability:
+- Reduce easy bot flags (AutomationControlled, webdriver). Stable UA + lang.
+- On failures, dump HTML, screenshot and body text to scripts/*.*
 """
 
 from splinter import Browser
@@ -60,6 +64,14 @@ def upsert_vehicle(row):
 
 # ---------------- CONFIG ----------------
 BASE_URL = "https://www.encar.com/fc/fc_carsearchlist.do?carType=for#!%7B%22action%22%3A%22(And.Year.range(201500..)._.Hidden.N._.CarType.N._.SellType.%EC%9D%BC%EB%B0%98.)%22%2C%22toggle%22%3A%7B%224%22%3A0%7D%2C%22layer%22%3A%22%22%2C%22sort%22%3A%22ModifiedDate%22%2C%22page%22%3A1%2C%22limit%22%3A20%2C%22searchKey%22%3A%22%22%2C%22loginCheck%22%3Afalse%7D"
+
+# Try multiple app shells; first successful one wins.
+SEARCH_URLS = [
+    BASE_URL,
+    "https://fem.encar.com/cars/list",
+    "https://www.encar.com/fc/fc_carsearchlist.do?carType=for",
+]
+
 MAX_LISTINGS = int(os.getenv("MAX_LISTINGS", "3"))
 PER_PAGE     = int(os.getenv("PER_PAGE", "20"))
 APP_ROOT = pathlib.Path(__file__).resolve().parent
@@ -170,6 +182,37 @@ BRAND_MAP = {
 }
 
 # ---------------- Helpers ----------------
+def mkdirs(p):
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        pass
+
+def debug_dump(browser, tag="list"):
+    outdir = os.getenv("DEBUG_DIR", str(APP_ROOT / "scripts"))
+    mkdirs(outdir)
+    html = ""
+    try:
+        html = browser.html or ""
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(outdir, f"{tag}.html"), "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception:
+        pass
+    try:
+        # best-effort screenshot
+        browser.driver.save_screenshot(os.path.join(outdir, f"{tag}.png"))
+    except Exception:
+        pass
+    try:
+        txt = browser.evaluate_script("document.body ? document.body.innerText.slice(0,2000) : ''") or ""
+        with open(os.path.join(outdir, f"{tag}.txt"), "w", encoding="utf-8") as f:
+            f.write(txt)
+    except Exception:
+        pass
+
 def is_korean(txt: str) -> bool:
     if not txt: return False
     return bool(re.search(r'[\uac00-\ud7a3]', str(txt)))
@@ -379,7 +422,7 @@ def list_row_dom_extract(row):
         sels = [
             'td.inf a.newLink._link',
             'td.img a.newLink._link',
-            'a[data-enlog-dt-eventname="차량상세"]',
+            'a[data-enlog-dt-eventnamegroup="차량상세"]',
             'a[href*="/dc/dc_cardetailview"]',
             'a[href*="/cars/detail/"]',
             'a[href]'
@@ -651,7 +694,30 @@ def find_list_rows(browser):
             pass
     return []
 
+def any_detail_links(browser) -> bool:
+    js = r"""
+    (function(){
+      function isDetail(h){ return /\/cars\/detail\/\d+/.test(h) || /dc_cardetailview/.test(h) || /carid=\d{6,}/.test(h); }
+      var a = Array.from(document.querySelectorAll('a[href]')).some(el => {
+        var h = el.getAttribute('href')||'';
+        if (!h) return false;
+        var abs; try{ var t=document.createElement('a'); t.href=h; abs=t.href; }catch(e){ abs=h; }
+        return isDetail(h) || isDetail(abs);
+      });
+      if (a) return true;
+      var b = Array.from(document.querySelectorAll('[data-carid],[data-car-id],[data-carno],[data-car-no]')).length > 0;
+      if (b) return true;
+      var txt = document.body ? document.body.innerText : '';
+      return /carid\s*=\s*\d{6,}/i.test(txt);
+    })()
+    """
+    try:
+        return bool(browser.evaluate_script(js))
+    except Exception:
+        return False
+
 def dismiss_overlays(browser):
+    # Click common close/consent controls + by text (KR/EN)
     try:
         sels = [
             'button[aria-label*="close" i]', 'button[title*="close" i]', 'button[class*="close" i]',
@@ -663,10 +729,44 @@ def dismiss_overlays(browser):
                 try:
                     el = browser.find_by_css(sel).first
                     if el and el.visible:
-                        browser.execute_script("arguments[0].click();", el._element)
+                        try:
+                            browser.execute_script("arguments[0].click();", el._element)
+                        except Exception:
+                            el.click()
                         time.sleep(0.2)
                 except Exception:
                     pass
+    except Exception:
+        pass
+
+    # Click by innerText + nuke obvious overlays
+    js = r"""
+    (function(){
+      function clickByText(rx){
+        var nodes = Array.from(document.querySelectorAll('button,a,[role="button"],.btn'));
+        for (var el of nodes){
+          var t=(el.textContent||'').replace(/\s+/g,' ').trim();
+          if (rx.test(t)){
+            try{ el.scrollIntoView({block:'center'});}catch(e){}
+            try{ el.click(); return true; }catch(e){}
+          }
+        }
+        return false;
+      }
+      var patterns = [
+        /동의|확인|전체 동의|쿠키.*동의|만 ?19세|성인/i,
+        /I ?agree|Accept|Agree|Got it|Allow|Close/i
+      ];
+      for (var i=0;i<patterns.length;i++){
+        if (clickByText(patterns[i])) return true;
+      }
+      Array.from(document.querySelectorAll('[class*="overlay"],[class*="modal"],[id*="consent"],[class*="cookie"]'))
+        .forEach(n=>{ try{ n.style.display='none'; }catch(e){} });
+      return false;
+    })()
+    """
+    try:
+        browser.evaluate_script(js)
     except Exception:
         pass
 
@@ -676,6 +776,8 @@ def wait_for_list(browser, timeout=15) -> bool:
         dismiss_overlays(browser)
         rows = find_list_rows(browser)
         if rows:
+            return True
+        if any_detail_links(browser):
             return True
         try:
             browser.execute_script("window.scrollBy(0, 600);")
@@ -712,6 +814,7 @@ def force_load_list_rows(browser, want=PER_PAGE, max_scrolls=24, pause=0.35) -> 
 
     seen, tries = -1, 0
     while tries < max_scrolls and row_count() < want:
+        dismiss_overlays(browser)
         for _ in range(2):
             try: browser.execute_script("window.scrollBy(0, 1200);")
             except: pass
@@ -730,6 +833,11 @@ def force_load_list_rows(browser, want=PER_PAGE, max_scrolls=24, pause=0.35) -> 
 
     time.sleep(0.25)
     cnt = row_count()
+
+    # If still zero but we can see detail links, let collectors run later
+    if cnt == 0 and any_detail_links(browser):
+        return 0
+
     return int(cnt if isinstance(cnt, int) else 0)
 
 # ---------------- Images ----------------
@@ -1808,7 +1916,7 @@ def go_to_page(browser, page_no, timeout=10):
         t0 = time.time()
         while time.time()-t0 < timeout:
             try:
-                if len(find_list_rows(browser)) > 0:
+                if len(find_list_rows(browser)) > 0 or any_detail_links(browser):
                     return True
             except:
                 pass
@@ -1992,17 +2100,27 @@ def build_browser():
     if headless:
         opts.add_argument("--headless=new")
 
-    # CI-safe flags (OK in headful too)
+    # CI-safe & stealth-ish flags
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--lang=en-US")
+    # Accept KR to improve rendering completeness; translate prefs force EN UI later.
+    opts.add_argument("--lang=ko-KR,ko,en-US,en")
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
+
+    # Stable desktop UA (override with UA=...)
+    ua = os.getenv(
+        "UA",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+    opts.add_argument(f"--user-agent={ua}")
 
     # Use setup-chrome’s path if present
     chrome_bin = (os.environ.get("CHROME_BIN")
@@ -2037,6 +2155,11 @@ def build_browser():
             br.driver.set_script_timeout(45)
         except Exception:
             pass
+        # Stealth: hide webdriver flag
+        try:
+            br.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        except Exception:
+            pass
         yield br
     finally:
         try: br.quit()
@@ -2044,10 +2167,18 @@ def build_browser():
 
 def main():
     with build_browser() as browser:
-        browser.visit(BASE_URL)
-        time.sleep(3)
-        wait_ready(browser, 10)
-        ensure_english(browser, 5)
+        # Try multiple shells until one mounts rows/state/links
+        loaded = False
+        for url in SEARCH_URLS:
+            browser.visit(url)
+            time.sleep(3)
+            wait_ready(browser, 10)
+            ensure_english(browser, 5)
+            if wait_for_state(browser, 6) or any_detail_links(browser) or find_list_rows(browser):
+                loaded = True
+                break
+        if not loaded:
+            debug_dump(browser, "boot_fail")
 
         # Make sure the first page actually has rows, then force-load
         if not wait_for_list(browser, timeout=20):
@@ -2100,6 +2231,8 @@ def main():
                     urls = dedup(urls + urls_ifr)
 
                 print(f"[fallback] collected {len(urls)} detail urls")
+                if len(urls) == 0:
+                    debug_dump(browser, "list_zero")
 
                 # Build a fast map from carid->state record (title/price)
                 record_by_cid = defaultdict(dict)
@@ -2176,6 +2309,13 @@ def main():
                     i += 1
                     print(f"✅ {total_done}/{MAX_LISTINGS} (fallback-by-carid)")
                 print(f"🎯 Finished. Saved to {csv_path}")
+                try:
+                    debug_dir = os.path.join(APP_ROOT, "scripts")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    with open(os.path.join(debug_dir, "debug.html"), "w", encoding="utf-8") as f:
+                        f.write(browser.html or "")
+                except Exception as _e:
+                    print(f"[debug-skip] could not write debug.html: {_e}")
                 return
             # ------- /FALLBACK FLOW -------
 
@@ -2339,12 +2479,10 @@ def main():
            os.makedirs(debug_dir, exist_ok=True)
            with open(os.path.join(debug_dir, "debug.html"), "w", encoding="utf-8") as f:
                # Splinter convenience: full current page HTML
-               f.write(browser.html)
+               f.write(browser.html or "")
         except Exception as _e:
-       
            print(f"[debug-skip] could not write debug.html: {_e}")
 
 
 if __name__ == "__main__":
     main()
-
