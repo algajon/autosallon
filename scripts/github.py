@@ -44,6 +44,7 @@ import pymysql
 import pathlib
 import tempfile, shutil
 from contextlib import contextmanager
+import random
 
 def db_conn():
     return pymysql.connect(
@@ -180,6 +181,11 @@ BRAND_MAP = {
     "렉서스":"Lexus","토요타":"Toyota","닛산":"Nissan","혼다":"Honda","스즈키":"Suzuki",
     "미니":"MINI","포르쉐":"Porsche","캐딜락":"Cadillac","इन피니टी":"Infiniti","쉐보레":"Chevrolet",
 }
+
+BOT_WALL_RX = re.compile(
+    r"(unusual traffic|verify you are human|are you a robot|봇이|자동화|차단되었습니다|보안 인증|접근이 제한|captcha|cloudflare|access denied)",
+    re.I
+)
 
 # ---------------- Helpers ----------------
 def mkdirs(p):
@@ -1845,37 +1851,138 @@ def absolutize(href):
     if not href: return ""
     return href if href.startswith("http") else "https://www.encar.com"+(href if href.startswith("/") else "/"+href)
 
-def click_detail_and_get_url(browser, row, retries=3):
-    sels = [
-        'td.inf a.newLink._link',
-        'td.img a.newLink._link',
-        'a[data-enlog-dt-eventname="차량상세"]',
-        'a[href*="dc_cardetailview"]'
-    ]
-    href=""
-    for sel in sels:
-        links=row.find_by_css(sel)
-        if not links: continue
-        el = links.first
-        try: href = el["href"]
-        except: href=""
-        for _ in range(retries):
+def click_detail_and_get_url(browser, row, retries=3, force_new_tab=True):
+    """
+    Bot-hardened opener:
+      - Prefers opening detail in a NEW TAB (window.open) to avoid SPA traps.
+      - Falls back to JS click / dispatch if normal click is intercepted.
+      - Dismisses overlays before each attempt.
+      - Returns the ABSOLUTE detail href if known (even if same-tab fallback is used).
+    """
+    import time, re
+
+    def absolutize(href: str) -> str:
+        if not href:
+            return ""
+        return href if href.startswith("http") else "https://www.encar.com" + (href if href.startswith("/") else "/" + href)
+
+    def try_window_open(href: str) -> bool:
+        if not href:
+            return False
+        try:
+            browser.execute_script("window.open(arguments[0], '_blank', 'noopener');", href)
+            return True
+        except Exception:
+            return False
+
+    def js_click(el) -> bool:
+        try:
+            browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el._element)
+        except Exception:
+            pass
+        try:
+            el.click()
+            return True
+        except Exception:
             try:
-                browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el._element); time.sleep(0.12)
-                (el.click() if el.visible else browser.execute_script("arguments[0].click();", el._element))
+                browser.execute_script("arguments[0].click();", el._element)
+                return True
+            except Exception:
+                try:
+                    browser.execute_script(
+                        "arguments[0].dispatchEvent(new MouseEvent('click', {bubbles:true,cancelable:true,view:window}));",
+                        el._element
+                    )
+                    return True
+                except Exception:
+                    return False
+
+    def pick_href_from_row() -> str:
+        # Greedy search inside the row for any plausible detail href
+        sels = [
+            'td.inf a.newLink._link',
+            'td.img a.newLink._link',
+            'a[data-enlog-dt-eventnamegroup="차량상세"]',
+            'a[href*="/dc/dc_cardetailview"]',
+            'a[href*="/cars/detail/"]',
+            'a[href]'
+        ]
+        for sel in sels:
+            try:
+                els = row.find_by_css(sel)
+                if els:
+                    try:
+                        h = els.first["href"]
+                        if h:
+                            return h
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            el = row.find_by_tag("a").first
+            return el["href"]
+        except Exception:
+            return ""
+
+    # --- Attempt strategy ---
+    href_seen = pick_href_from_row()
+    for attempt in range(max(1, retries)):
+        try:
+            dismiss_overlays(browser)
+        except Exception:
+            pass
+
+        # Re-resolve current href in case the DOM re-rendered
+        href = pick_href_from_row() or href_seen
+        href_seen = href or href_seen
+
+        # Prefer new-tab open (less likely to be intercepted by SPA handlers)
+        if force_new_tab and href:
+            if try_window_open(href):
                 return absolutize(href)
-            except (ElementNotInteractableException, ElementClickInterceptedException, StaleElementReferenceException):
-                time.sleep(0.25)
-            except:
-                time.sleep(0.25)
-    # last-resort generic anchor
+
+        # Else: try to click the best-known anchors
+        for sel in [
+            'td.inf a.newLink._link',
+            'td.img a.newLink._link',
+            'a[data-enlog-dt-eventnamegroup="차량상세"]',
+            'a[href*="/dc/dc_cardetailview"]',
+            'a[href*="/cars/detail/"]',
+            'a[href]'
+        ]:
+            try:
+                anchors = row.find_by_css(sel)
+            except Exception:
+                anchors = []
+            if not anchors:
+                continue
+            el = anchors.first
+
+            # Scroll and try a JS click chain
+            if js_click(el):
+                # If we know the href, return it; otherwise try to read again
+                try:
+                    href = el["href"]
+                except Exception:
+                    href = pick_href_from_row()
+                return absolutize(href)
+
+        time.sleep(0.25)
+
+    # Last resort: generic <a> click
     try:
-        el=row.find_by_tag("a").first; href=el["href"]
-        browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el._element); time.sleep(0.12)
-        (el.click() if el.visible else browser.execute_script("arguments[0].click();", el._element))
-        return absolutize(href)
-    except:
-        return ""
+        el = row.find_by_tag("a").first
+        if js_click(el):
+            try:
+                href = el["href"]
+            except Exception:
+                href = href_seen
+            return absolutize(href)
+    except Exception:
+        pass
+
+    return absolutize(href_seen or "")
 
 def switch_to_new_tab(browser, prev_count, timeout=8):
     t0=time.time()
@@ -2074,6 +2181,241 @@ def collect_listing_urls_iframes(browser, want_urls=MAX_LISTINGS):
             try: browser.driver.switch_to.default_content()
             except: pass
     return dedup(out)[:want_urls]
+def install_stealth_patches(browser):
+    """
+    Patch common bot fingerprints in-page.
+    Safe to call many times; no external libs required.
+    """
+    js = r"""
+    (function () {
+      try {
+        // 1) navigator.webdriver
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+        // 2) window.chrome (expected on Chrome)
+        if (!window.chrome) {
+          Object.defineProperty(window, 'chrome', { value: { runtime: {} } });
+        }
+
+        // 3) navigator.languages
+        try {
+          const langs = (navigator.language || 'en-US').startsWith('ko') ? ['ko-KR','ko','en-US','en'] : ['en-US','en'];
+          Object.defineProperty(navigator, 'languages', { get: () => langs });
+        } catch(e){}
+
+        // 4) navigator.plugins (non-empty)
+        try {
+          Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+        } catch(e){}
+
+        // 5) permissions.query → keep notifications consistent
+        try {
+          const origQuery = navigator.permissions && navigator.permissions.query;
+          if (origQuery) {
+            navigator.permissions.query = (p) => {
+              if (p && p.name === 'notifications') {
+                return Promise.resolve({ state: Notification.permission });
+              }
+              return origQuery(p);
+            };
+          }
+        } catch(e){}
+
+        // 6) WebGL vendor/renderer (common desktop values)
+        try {
+          const OV = 37445, OR = 37446; // UNMASKED_VENDOR/RENDERER
+          const vendor = 'Google Inc.';
+          const renderer = 'ANGLE (Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)';
+
+          function wrap(ctx) {
+            const gp = ctx.getParameter;
+            Object.defineProperty(ctx, 'getParameter', {
+              value: function (p) {
+                if (p === OV) return vendor;
+                if (p === OR) return renderer;
+                try { return gp.call(this, p); } catch(e) { return gp.call(this, p); }
+              }
+            });
+          }
+
+          if (window.WebGLRenderingContext) wrap(WebGLRenderingContext.prototype);
+          if (window.WebGL2RenderingContext) wrap(WebGL2RenderingContext.prototype);
+        } catch(e){}
+
+        // 7) userAgentData – reduce entropy / stable answers
+        try {
+          if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+            const orig = navigator.userAgentData.getHighEntropyValues.bind(navigator.userAgentData);
+            navigator.userAgentData.getHighEntropyValues = (hints) => {
+              return orig(hints).then(res => Object.assign({
+                architecture: 'x86', bitness: '64', model: '', platform: 'Windows', platformVersion: '15.0.0'
+              }, res)).catch(_ => ({architecture:'x86', bitness:'64', model:'', platform:'Windows', platformVersion:'15.0.0'}));
+            };
+          }
+        } catch(e){}
+
+        // 8) small touch: hairline media feature can betray headless on some setups
+        try { Object.defineProperty(window, 'devicePixelRatio', { get: () => Math.max(1, Math.floor(window.devicePixelRatio||1)) }); } catch(e){}
+
+        window.__stealth_ok = true;
+      } catch (e) { try { console.debug('stealth error', e); } catch(_){} }
+    })();
+    """
+    try:
+        browser.execute_script(js)
+    except Exception:
+        pass
+
+def set_cdp_fingerprints(browser):
+    """
+    Aligns timezone/locale/geo with your target audience or env vars.
+    These are hints, not guarantees; wrapped in try/except to be safe.
+    Env overrides:
+      TZ_ID=Asia/Seoul
+      LOCALE=ko-KR   (or en-US)
+      GEO_LAT=37.5665  GEO_LON=126.9780  GEO_ACC=100
+    """
+    d = getattr(browser, "driver", None)
+    if not d:
+        return
+    try:
+        tz = os.getenv("TZ_ID", "Asia/Seoul")
+        d.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": tz})
+    except Exception:
+        pass
+    try:
+        loc = os.getenv("LOCALE", "en-US")
+        d.execute_cdp_cmd("Emulation.setLocaleOverride", {"locale": loc})
+    except Exception:
+        pass
+    try:
+        lat = float(os.getenv("GEO_LAT", "37.5665"))
+        lon = float(os.getenv("GEO_LON", "126.9780"))
+        acc = float(os.getenv("GEO_ACC", "100"))
+        d.execute_cdp_cmd("Emulation.setGeolocationOverride", {"latitude": lat, "longitude": lon, "accuracy": acc})
+    except Exception:
+        pass
+
+
+def human_pause(a=0.08, b=0.35):
+    time.sleep(random.uniform(a, b))
+
+def human_scroll(browser, passes=3):
+    try:
+        h = browser.evaluate_script("document.body && document.body.scrollHeight || 0") or 0
+    except Exception:
+        h = 0
+    if not h:
+        # generic nudges
+        for _ in range(passes*2):
+            try: browser.execute_script(f"window.scrollBy(0,{random.randint(200,900)})")
+            except: pass
+            human_pause()
+        try: browser.execute_script("window.scrollTo(0,0)")
+        except: pass
+        return
+
+    y = 0
+    step = max(250, int(h / (6 + random.randint(0,4))))
+    for _ in range(passes):
+        y = 0
+        while y < h:
+            dy = step + random.randint(0, 200)
+            y += dy
+            try: browser.execute_script(f"window.scrollTo(0,{y})")
+            except: pass
+            human_pause()
+        human_pause(0.2, 0.6)
+        try: browser.execute_script("window.scrollTo(0,0)")
+        except: pass
+        human_pause(0.2, 0.5)
+
+def human_mouse_wiggle(browser):
+    js = r"""
+    (function(){
+      try{
+        const rect = {w: window.innerWidth||1200, h: window.innerHeight||800};
+        const n = 12 + Math.floor(Math.random()*12);
+        for (let i=0;i<n;i++){
+          const x = 40 + Math.floor(Math.random()*(rect.w-80));
+          const y = 40 + Math.floor(Math.random()*(rect.h-80));
+          const e = new MouseEvent('mousemove',{bubbles:true,cancelable:true,clientX:x,clientY:y});
+          document.dispatchEvent(e);
+        }
+      }catch(e){}
+    })();
+    """
+    try:
+        browser.execute_script(js)
+    except Exception:
+        pass
+
+def hit_bot_wall(browser) -> bool:
+    try:
+        txt = browser.evaluate_script("document.body ? document.body.innerText.slice(0,8000) : ''") or ""
+    except Exception:
+        txt = ""
+    if BOT_WALL_RX.search(txt):
+        debug_dump(browser, "bot_wall_detected")
+        return True
+    return False
+
+def visit_safely(browser, url, max_tries=3):
+    """
+    Navigate with light jitter/backoff and stealth hooks.
+    Returns True on success, False otherwise.
+    """
+    for i in range(1, max_tries+1):
+        try:
+            # Add a small cache-buster when retrying
+            target = url
+            if i > 1:
+                sep = "&" if ("?" in url) else "?"
+                target = f"{url}{sep}_={int(time.time()*1000)%100000}"
+            browser.visit(target)
+            wait_ready(browser, 15)
+            install_stealth_patches(browser)  # safe to re-run
+            human_mouse_wiggle(browser)
+            human_pause(0.2, 0.7)
+            ensure_english(browser, 5)
+            if hit_bot_wall(browser):
+                time.sleep(1.5 * i + random.uniform(0,1))
+                continue
+            return True
+        except UnexpectedAlertPresentException:
+            _handle_alert_if_any(browser)
+        except Exception:
+            time.sleep(0.6 * i + random.uniform(0,0.6))
+    return False
+
+def trusted_click(browser, el):
+    """
+    Dispatch a real MouseEvent('click') as some UIs ignore programmatic .click().
+    """
+    try:
+        browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el._element)
+    except Exception:
+        pass
+    human_pause(0.05, 0.15)
+    try:
+        browser.execute_script("""
+          (function(el){
+            try{
+              el.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,cancelable:true}));
+              el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}));
+              el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,cancelable:true}));
+              el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+            }catch(e){ try{ el.click(); }catch(_e){} }
+          })(arguments[0]);
+        """, el._element)
+        return True
+    except Exception:
+        try:
+            el.click()
+            return True
+        except Exception:
+            return False
+
 
 def collect_listing_urls_from_state(browser, want_urls=MAX_LISTINGS):
     st = get_full_state(browser) if wait_for_state(browser, 5) else {}
@@ -2096,7 +2438,7 @@ def build_browser():
     opts = Options()
 
     # Headful (unless HEADLESS=1)
-    headless = os.getenv("HEADLESS", "").strip() in ("1", "true", "yes")
+    headless = os.getenv("HEADLESS", "").strip().lower() in ("1", "true", "yes")
     if headless:
         opts.add_argument("--headless=new")
 
@@ -2150,38 +2492,64 @@ def build_browser():
 
     br = Browser("chrome", options=opts, service=service)
     try:
+        # Timeouts
         try:
             br.driver.set_page_load_timeout(60)
             br.driver.set_script_timeout(45)
         except Exception:
             pass
-        # Stealth: hide webdriver flag
+
+        # Baseline stealth: hide webdriver flag (kept for redundancy)
         try:
             br.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
         except Exception:
             pass
+
+        # NEW: CDP + in-page stealth patches (toggle with STEALTH=0 to disable)
+        stealth_on = os.getenv("STEALTH", "1").strip().lower() in ("1", "true", "yes", "on", "")
+        if stealth_on:
+            try: set_cdp_fingerprints(br)
+            except Exception: pass
+            try: install_stealth_patches(br)
+            except Exception: pass
+            try: human_mouse_wiggle(br)
+            except Exception: pass
+
         yield br
     finally:
-        try: br.quit()
-        except Exception: pass
+        try:
+            br.quit()
+        except Exception:
+            pass
 
 def main():
+    import time, os, csv, json, re, random
     with build_browser() as browser:
         # Try multiple shells until one mounts rows/state/links
         loaded = False
         for url in SEARCH_URLS:
-            browser.visit(url)
-            time.sleep(3)
-            wait_ready(browser, 10)
+            try:
+                browser.visit(url)
+            except Exception:
+                continue
+            # light human-ish pacing
+            time.sleep(random.uniform(1.2, 2.0))
+            wait_ready(browser, 12)
             ensure_english(browser, 5)
+            try:
+                # micro interaction to look less botty
+                browser.execute_script("window.scrollBy(0, Math.floor(200 + Math.random()*400));")
+            except Exception:
+                pass
             if wait_for_state(browser, 6) or any_detail_links(browser) or find_list_rows(browser):
                 loaded = True
                 break
+
         if not loaded:
             debug_dump(browser, "boot_fail")
 
         # Make sure the first page actually has rows, then force-load
-        if not wait_for_list(browser, timeout=20):
+        if not wait_for_list(browser, timeout=25):
             force_load_list_rows(browser, want=PER_PAGE)
 
         cnt = force_load_list_rows(browser, want=PER_PAGE)
@@ -2213,7 +2581,7 @@ def main():
             rows = find_list_rows(browser)
             rows_count = len(rows)
 
-            # ------- HARDENED FALLBACK FLOW -------
+            # ------- HARDENED FALLBACK FLOW (no visible rows) -------
             if rows_count == 0:
                 print("[fallback] no list rows found; trying state-based URLs...")
 
@@ -2235,6 +2603,7 @@ def main():
                     debug_dump(browser, "list_zero")
 
                 # Build a fast map from carid->state record (title/price)
+                from collections import defaultdict
                 record_by_cid = defaultdict(dict)
                 for r in state_records:
                     cid = r.get("carid","")
@@ -2245,7 +2614,6 @@ def main():
                 i = 0
                 while i < len(urls) and total_done < MAX_LISTINGS:
                     detail_url = urls[i]
-                    # carid extraction from the url
                     m = re.search(r'/detail/(\d{6,})|[?&]carid=(\d{6,})', detail_url)
                     carid = (m.group(1) or m.group(2)) if m else ""
 
@@ -2258,9 +2626,20 @@ def main():
                     brand, model, variant = parse_title_brand_model_variant(title)
                     _krw, eur_list = parse_list_price_eur(priceText, priceNum, "")
 
-                    # Open detail directly
-                    browser.visit(detail_url)
-                    time.sleep(1.0)
+                    # Open detail directly (visit in same tab here)
+                    try:
+                        browser.visit(detail_url)
+                    except Exception:
+                        # if blocked once, small pause then retry a second time
+                        time.sleep(random.uniform(0.8, 1.6))
+                        try:
+                            browser.visit(detail_url)
+                        except Exception:
+                            debug_dump(browser, "detail_visit_error")
+                            i += 1
+                            continue
+
+                    time.sleep(random.uniform(0.8, 1.5))
                     ensure_english(browser, 4)
                     raw = scrape_detail_raw(browser)
 
@@ -2308,12 +2687,16 @@ def main():
                     total_done += 1
                     i += 1
                     print(f"✅ {total_done}/{MAX_LISTINGS} (fallback-by-carid)")
+
+                    # tiny jitter between cars
+                    time.sleep(random.uniform(0.25, 0.55))
+
                 print(f"🎯 Finished. Saved to {csv_path}")
                 try:
                     debug_dir = os.path.join(APP_ROOT, "scripts")
                     os.makedirs(debug_dir, exist_ok=True)
-                    with open(os.path.join(debug_dir, "debug.html"), "w", encoding="utf-8") as f:
-                        f.write(browser.html or "")
+                    with open(os.path.join(debug_dir, "debug.html"), "w", encoding="utf-8") as df:
+                        df.write(browser.html or "")
                 except Exception as _e:
                     print(f"[debug-skip] could not write debug.html: {_e}")
                 return
@@ -2330,13 +2713,22 @@ def main():
                     cnt = force_load_list_rows(browser, want=PER_PAGE)
                     print(f"[list] page {current_page} rows loaded: {cnt}")
 
-                time.sleep(0.8)
+                time.sleep(random.uniform(0.5, 1.2))
                 ensure_english(browser, 3)
+
+                # Quick bot-wall check
+                try:
+                    btxt = (browser.evaluate_script("document.body?document.body.innerText.slice(0,1500).toLowerCase():''") or "")
+                    if re.search(r'captcha|봇이 아닙니다|are you human|bot.?detected', btxt):
+                        print("[notice] Possible bot-wall text found; backing off briefly.")
+                        debug_dump(browser, f"botwall_p{current_page}")
+                        time.sleep(random.uniform(2.0, 3.5))
+                except Exception:
+                    pass
 
                 list_state = get_full_state(browser) if wait_for_state(browser, 3) else {}
                 state_records = get_list_records_from_state(list_state)
 
-                # Always use the robust Encar selector set
                 rows = find_list_rows(browser)
                 rows_count = len(rows)
                 if rows_count < PER_PAGE:
@@ -2361,7 +2753,7 @@ def main():
                     else:
                         try:
                             rec["row_html"] = row.html
-                        except:
+                        except Exception:
                             rec["row_html"] = ""
 
                     title     = (rec.get("title") or "").strip()
@@ -2388,38 +2780,67 @@ def main():
 
                     listing_thumb = extract_listing_thumb(row)
 
+                    # Try to open detail (prefer new tab, but we can recover to same-tab visit)
                     prev_tabs = len(browser.windows)
-                    detail_url = click_detail_and_get_url(browser, row)
+                    detail_url = click_detail_and_get_url(browser, row, retries=3, force_new_tab=True)
 
-                    if detail_url and switch_to_new_tab(browser, prev_tabs, 8):
-                        time.sleep(0.9)
-                        ensure_english(browser, 4)
-                        raw = scrape_detail_raw(browser)
+                    opened_in_new_tab = switch_to_new_tab(browser, prev_tabs, 8)
+                    raw = None
+
+                    if opened_in_new_tab:
                         try:
-                            browser.windows.current.close()
-                        except:
-                            pass
-                        try:
-                            browser.windows[0].is_current = True
-                        except:
-                            pass
-                        time.sleep(0.2)
+                            time.sleep(random.uniform(0.7, 1.3))
+                            ensure_english(browser, 4)
+                            raw = scrape_detail_raw(browser)
+                        finally:
+                            # Always close the tab to return to list
+                            try:
+                                browser.windows.current.close()
+                            except Exception:
+                                pass
+                            try:
+                                browser.windows[0].is_current = True
+                            except Exception:
+                                pass
+                            time.sleep(random.uniform(0.2, 0.5))
                     else:
-                        raw = {
-                            "manufacturer": "", "model": "", "grade": "",
-                            "form_year": "", "year_month": "",
-                            "ad_price": "", "price_text": priceText,
-                            "mileage": "", "fuel": "", "color": "",
-                            "transmission": "", "seats": "",
-                            "vin": "", "engine_cc": "",
-                            "images": [], "body_type": "",
-                            "features": [], "report_links": [], "carid": ""
-                        }
+                        # If no new tab, drive there in the same tab (or use href_raw)
+                        if not detail_url and href_raw:
+                            detail_url = absolutize(href_raw)
+                        if detail_url:
+                            try:
+                                browser.visit(detail_url)
+                                time.sleep(random.uniform(0.7, 1.3))
+                                ensure_english(browser, 4)
+                                raw = scrape_detail_raw(browser)
+                            except Exception:
+                                debug_dump(browser, "detail_visit_fallback_err")
+                            finally:
+                                # Best-effort return to list
+                                try:
+                                    browser.back()
+                                    wait_for_list(browser, timeout=12)
+                                except Exception:
+                                    pass
+                        else:
+                            # Could not navigate to detail; synthesize a minimal raw
+                            raw = {
+                                "manufacturer": "", "model": "", "grade": "",
+                                "form_year": "", "year_month": "",
+                                "ad_price": "", "price_text": priceText,
+                                "mileage": "", "fuel": "", "color": "",
+                                "transmission": "", "seats": "",
+                                "vin": "", "engine_cc": "",
+                                "images": [], "body_type": "",
+                                "features": [], "report_links": [], "carid": ""
+                            }
 
-                    imgs = raw.get("images", [])
+                    imgs = raw.get("images", []) if raw else []
                     if listing_thumb:
-                        imgs = [listing_thumb] + [u for u in imgs if u != listing_thumb]
-                        raw["images"] = imgs[:20]
+                        imgs = [listing_thumb] + [u for u in (imgs or []) if u != listing_thumb]
+                        imgs = imgs[:20]
+                        if raw is not None:
+                            raw["images"] = imgs
 
                     list_hint = {
                         "prodhuesi": brand,
@@ -2433,7 +2854,7 @@ def main():
                         "title": title,
                     }
 
-                    alb = to_albanian_schema(raw, detail_url, list_hint)
+                    alb = to_albanian_schema(raw or {}, detail_url, list_hint)
 
                     row_out = {
                         "prodhuesi": alb["prodhuesi"],
@@ -2468,20 +2889,22 @@ def main():
                     row_index += 1
                     print(f"✅ {total_done}/{MAX_LISTINGS} (page {current_page}, row {row_index})")
 
+                    # small human-like pause
+                    time.sleep(random.uniform(0.25, 0.55))
+
                 current_page += 1
                 _, tp = get_paging_info(browser)
                 total_pages = tp or total_pages
 
         print(f"🎯 Finished. Saved to {csv_path}")
-        
+
         try:
-           debug_dir = os.path.join(APP_ROOT, "scripts")
-           os.makedirs(debug_dir, exist_ok=True)
-           with open(os.path.join(debug_dir, "debug.html"), "w", encoding="utf-8") as f:
-               # Splinter convenience: full current page HTML
-               f.write(browser.html or "")
+            debug_dir = os.path.join(APP_ROOT, "scripts")
+            os.makedirs(debug_dir, exist_ok=True)
+            with open(os.path.join(debug_dir, "debug.html"), "w", encoding="utf-8") as fdbg:
+                fdbg.write(browser.html or "")
         except Exception as _e:
-           print(f"[debug-skip] could not write debug.html: {_e}")
+            print(f"[debug-skip] could not write debug.html: {_e}")
 
 
 if __name__ == "__main__":
